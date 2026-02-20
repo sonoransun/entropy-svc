@@ -1,0 +1,16 @@
+[package]
+name = "mixrand"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rand_chacha = "0.9"
+rand_core = "0.9"
+blake2 = "0.10"
+base64 = "0.22"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+log = "0.4"
+syslog = "7"
