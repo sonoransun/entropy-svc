@@ -23,6 +23,46 @@ pub fn collect_jitter_samples(count: usize) -> Vec<u8> {
     samples
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_collect_correct_size() {
+        let samples = collect_jitter_samples(64);
+        assert_eq!(samples.len(), 64 * 8); // 64 samples × 8 bytes each
+    }
+
+    #[test]
+    fn test_collect_zero_samples() {
+        let samples = collect_jitter_samples(0);
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn test_collect_single_sample() {
+        let samples = collect_jitter_samples(1);
+        assert_eq!(samples.len(), 8);
+    }
+
+    #[test]
+    fn test_samples_not_constant() {
+        let samples = collect_jitter_samples(16);
+        // All 8-byte chunks should not be identical (timing varies)
+        let chunks: Vec<&[u8]> = samples.chunks(8).collect();
+        let first = chunks[0];
+        let all_same = chunks.iter().all(|c| *c == first);
+        assert!(!all_same, "jitter samples should not all be identical");
+    }
+
+    #[test]
+    fn test_samples_have_variation() {
+        let samples = collect_jitter_samples(32);
+        // At least some bytes should be non-zero
+        assert!(samples.iter().any(|&b| b != 0));
+    }
+}
+
 fn clock_gettime_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,

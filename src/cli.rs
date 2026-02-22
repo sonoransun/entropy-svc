@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 
-use crate::config::CpuRngPreference;
+use crate::config::{CpuRngPreference, MixerMode};
 use crate::logging::LogArgs;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -27,6 +28,16 @@ pub enum OutputFormat {
     HexUpper,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CheckOutputFormat {
+    /// Human-readable text (default)
+    Text,
+    /// JSON
+    Json,
+    /// CSV
+    Csv,
+}
+
 #[derive(Debug, Args)]
 pub struct CpuRngArgs {
     /// Enable RDSEED instruction
@@ -41,6 +52,14 @@ pub struct CpuRngArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub enable_xstore: Option<bool>,
 
+    /// Enable AArch64 RNDR instruction
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_rndr: Option<bool>,
+
+    /// Enable AArch64 RNDRRS instruction (reseeded)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_rndrrs: Option<bool>,
+
     /// RDRAND retry count (1-100)
     #[arg(long)]
     pub rdrand_retries: Option<u32>,
@@ -48,6 +67,14 @@ pub struct CpuRngArgs {
     /// RDSEED retry count (1-100)
     #[arg(long)]
     pub rdseed_retries: Option<u32>,
+
+    /// RNDR retry count (1-100)
+    #[arg(long)]
+    pub rndr_retries: Option<u32>,
+
+    /// RNDRRS retry count (1-100)
+    #[arg(long)]
+    pub rndrrs_retries: Option<u32>,
 
     /// XSTORE quality factor (0-3)
     #[arg(long)]
@@ -64,10 +91,14 @@ pub struct CpuRngArgs {
     /// Standalone CPU RNG oversample ratio (1-16)
     #[arg(long)]
     pub oversample: Option<u32>,
+
+    /// Mixer mode: blake2b (default) or hkdf (two-stage extract-then-expand)
+    #[arg(long, value_enum)]
+    pub mixer_mode: Option<MixerMode>,
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "mixrand", about = "Secure random byte generator for Linux")]
+#[command(name = "mixrand", about = "Secure random byte generator")]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct Cli {
     /// Number of random bytes to generate
@@ -86,6 +117,22 @@ pub struct Cli {
     #[arg(long = "config")]
     pub config_file: Option<PathBuf>,
 
+    /// Verbose output (sets log level to debug)
+    #[arg(short = 'v', long, conflicts_with = "quiet")]
+    pub verbose: bool,
+
+    /// Quiet output (sets log level to error)
+    #[arg(short = 'q', long, conflicts_with = "verbose")]
+    pub quiet: bool,
+
+    /// Print the effective configuration and exit
+    #[arg(long)]
+    pub show_config: bool,
+
+    /// Generate N independent random outputs
+    #[arg(long)]
+    pub count: Option<usize>,
+
     #[command(flatten)]
     pub cpu_rng: CpuRngArgs,
 
@@ -102,6 +149,10 @@ pub enum Command {
     Daemon(DaemonArgs),
     /// Run FIPS 140-2 statistical tests and entropy estimates against each entropy source
     Check(CheckArgs),
+    /// Generate shell completions for bash, zsh, fish, or PowerShell
+    Completions(CompletionsArgs),
+    /// List available entropy sources and their status
+    ListSources(ListSourcesArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -121,6 +172,14 @@ pub struct DaemonArgs {
     /// Bits of entropy credited per byte, 1-8 (default: 4)
     #[arg(short = 'c', long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub credit_ratio: u32,
+
+    /// Drop privileges to this user after opening /dev/random
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Path to PID file (checks for stale PIDs on startup)
+    #[arg(long)]
+    pub pid_file: Option<PathBuf>,
 
     /// Configuration file path (default: /etc/mixrand.toml)
     #[arg(long = "config")]
@@ -151,6 +210,10 @@ pub struct CheckArgs {
     #[arg(long, value_delimiter = ',')]
     pub sources: Option<Vec<String>>,
 
+    /// Output format for results
+    #[arg(long = "output-format", value_enum, default_value_t = CheckOutputFormat::Text)]
+    pub output_format: CheckOutputFormat,
+
     /// Configuration file path (default: /etc/mixrand.toml)
     #[arg(long = "config")]
     pub config_file: Option<PathBuf>,
@@ -160,4 +223,30 @@ pub struct CheckArgs {
 
     #[command(flatten)]
     pub log: LogArgs,
+}
+
+#[derive(Debug, Parser)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    pub shell: Shell,
+}
+
+#[derive(Debug, Parser)]
+pub struct ListSourcesArgs {
+    /// Configuration file path (default: /etc/mixrand.toml)
+    #[arg(long = "config")]
+    pub config_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub cpu_rng: CpuRngArgs,
+
+    #[command(flatten)]
+    pub log: LogArgs,
+}
+
+/// Generate shell completions and write to stdout.
+pub fn print_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "mixrand", &mut std::io::stdout());
 }

@@ -1,4 +1,7 @@
+use serde::Serialize;
+
 /// Result of a single statistical test.
+#[derive(Serialize)]
 pub struct TestResult {
     pub name: &'static str,
     pub passed: bool,
@@ -8,6 +11,7 @@ pub struct TestResult {
 }
 
 /// Result of the FIPS 140-2 test suite.
+#[derive(Serialize)]
 pub struct FipsResult {
     pub monobit: TestResult,
     pub poker: TestResult,
@@ -22,12 +26,19 @@ impl FipsResult {
 }
 
 /// Entropy quality estimates.
+#[derive(Serialize)]
 pub struct EntropyEstimates {
     pub shannon: f64,
     pub min_entropy: f64,
     pub chi_square: f64,
     pub mean: f64,
     pub serial_correlation: f64,
+    pub approx_entropy_m2: f64,
+    pub approx_entropy_m3: f64,
+    pub compression_ratio: f64,
+    pub block_entropy_2: f64,
+    pub block_entropy_4: f64,
+    pub autocorrelation: Vec<f64>,
 }
 
 /// FIPS 140-2 Monobit Test.
@@ -250,15 +261,20 @@ pub fn mean_byte(data: &[u8]) -> f64 {
 
 /// Serial correlation coefficient (lag-1 autocorrelation, expected ~0.0).
 pub fn serial_correlation(data: &[u8]) -> f64 {
-    if data.len() < 2 {
+    autocorrelation(data, 1)
+}
+
+/// Autocorrelation at a given lag.
+pub fn autocorrelation(data: &[u8], lag: usize) -> f64 {
+    if data.len() <= lag {
         return 0.0;
     }
     let n = data.len() as f64;
     let mean = data.iter().map(|&b| b as f64).sum::<f64>() / n;
 
     let mut numerator = 0.0;
-    for i in 0..data.len() - 1 {
-        numerator += (data[i] as f64 - mean) * (data[i + 1] as f64 - mean);
+    for i in 0..data.len() - lag {
+        numerator += (data[i] as f64 - mean) * (data[i + lag] as f64 - mean);
     }
 
     let denominator: f64 = data
@@ -274,6 +290,136 @@ pub fn serial_correlation(data: &[u8]) -> f64 {
     }
 
     numerator / denominator
+}
+
+/// Multi-lag autocorrelation for lags 1..=max_lag.
+pub fn multi_lag_autocorrelation(data: &[u8], max_lag: usize) -> Vec<f64> {
+    (1..=max_lag).map(|lag| autocorrelation(data, lag)).collect()
+}
+
+/// Approximate Entropy (ApEn) for block size m.
+///
+/// Operates on the bit-level representation of data (NIST standard formulation).
+/// For truly random data, ApEn(m=2) approaches ln(2) ≈ 0.693.
+/// Lower values indicate more regularity (less randomness).
+pub fn approximate_entropy(data: &[u8], m: usize) -> f64 {
+    if m == 0 || data.is_empty() {
+        return 0.0;
+    }
+
+    // Convert bytes to bits
+    let n_bits = data.len() * 8;
+    if n_bits <= m + 1 {
+        return 0.0;
+    }
+
+    fn get_bit(data: &[u8], bit_index: usize) -> u8 {
+        let byte_index = bit_index / 8;
+        let bit_offset = 7 - (bit_index % 8);
+        (data[byte_index] >> bit_offset) & 1
+    }
+
+    fn phi_bits(data: &[u8], n_bits: usize, m: usize) -> f64 {
+        use std::collections::HashMap;
+        if n_bits < m {
+            return 0.0;
+        }
+
+        let num_patterns = n_bits - m + 1;
+        let mut counts: HashMap<u64, u64> = HashMap::new();
+        for i in 0..num_patterns {
+            let mut pattern: u64 = 0;
+            for j in 0..m {
+                pattern = (pattern << 1) | get_bit(data, i + j) as u64;
+            }
+            *counts.entry(pattern).or_insert(0) += 1;
+        }
+
+        let n_f = num_patterns as f64;
+        counts
+            .values()
+            .map(|&c| {
+                let p = c as f64 / n_f;
+                p * p.ln()
+            })
+            .sum::<f64>()
+    }
+
+    phi_bits(data, n_bits, m) - phi_bits(data, n_bits, m + 1)
+}
+
+/// Lempel-Ziv complexity estimate (normalized).
+///
+/// Uses LZ78-style dictionary parsing: scans left-to-right, building phrases
+/// where each new phrase extends a previously seen phrase by one byte.
+/// For random data over an alphabet of size A and length n, expected
+/// complexity ≈ n / log_A(n). Returns the ratio, which should be ≈ 1.0 for
+/// random data and < 1.0 for structured data.
+pub fn lempel_ziv_complexity(data: &[u8]) -> f64 {
+    if data.len() < 2 {
+        return 0.0;
+    }
+
+    use std::collections::HashSet;
+    let n = data.len();
+    let mut dictionary = HashSet::new();
+    let mut complexity = 0u64;
+    let mut i = 0;
+
+    while i < n {
+        let mut k = 1;
+        while i + k <= n && dictionary.contains(&data[i..i + k]) {
+            k += 1;
+        }
+        if i + k <= n {
+            dictionary.insert(&data[i..i + k]);
+        }
+        complexity += 1;
+        i += k;
+    }
+
+    // For alphabet size A=256, expected phrases ≈ n / log_A(n)
+    let log_alpha_n = (n as f64).ln() / 256.0_f64.ln();
+    let expected = if log_alpha_n > f64::EPSILON {
+        n as f64 / log_alpha_n
+    } else {
+        n as f64
+    };
+    complexity as f64 / expected
+}
+
+/// Block entropy: Shannon entropy computed over multi-byte blocks.
+///
+/// For block_size=2, treats each pair of consecutive bytes as a 16-bit symbol.
+/// Returns entropy in bits per byte (not per block).
+pub fn block_entropy(data: &[u8], block_size: usize) -> f64 {
+    if block_size == 0 || data.len() < block_size {
+        return 0.0;
+    }
+
+    use std::collections::HashMap;
+    let mut counts: HashMap<&[u8], u64> = HashMap::new();
+    let num_blocks = data.len() / block_size;
+    if num_blocks == 0 {
+        return 0.0;
+    }
+
+    for i in 0..num_blocks {
+        let start = i * block_size;
+        *counts.entry(&data[start..start + block_size]).or_insert(0) += 1;
+    }
+
+    let n = num_blocks as f64;
+    let mut entropy = 0.0;
+    for &count in counts.values() {
+        if count > 0 {
+            let p = count as f64 / n;
+            entropy -= p * p.log2();
+        }
+    }
+
+    // Normalize to bits per byte
+    entropy / block_size as f64
 }
 
 /// Standard normal CDF (Abramowitz & Stegun approximation).
@@ -315,6 +461,12 @@ pub fn entropy_estimates(data: &[u8]) -> EntropyEstimates {
         chi_square: chi_square(data),
         mean: mean_byte(data),
         serial_correlation: serial_correlation(data),
+        approx_entropy_m2: approximate_entropy(data, 2),
+        approx_entropy_m3: approximate_entropy(data, 3),
+        compression_ratio: lempel_ziv_complexity(data),
+        block_entropy_2: block_entropy(data, 2),
+        block_entropy_4: block_entropy(data, 4),
+        autocorrelation: multi_lag_autocorrelation(data, 16),
     }
 }
 
@@ -330,6 +482,15 @@ mod tests {
         [0xAA; 2500]
     }
 
+    fn chacha_data() -> Vec<u8> {
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::{RngCore, SeedableRng};
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let mut data = vec![0u8; 4096];
+        rng.fill_bytes(&mut data);
+        data
+    }
+
     // --- FIPS Monobit ---
 
     #[test]
@@ -341,7 +502,6 @@ mod tests {
 
     #[test]
     fn test_monobit_aa_passes() {
-        // 0xAA = 10101010, each byte has 4 ones → 2500 * 4 = 10000
         let result = fips_monobit(&all_aa());
         assert!(result.passed);
         assert_eq!(result.value, 10000.0);
@@ -357,7 +517,6 @@ mod tests {
 
     #[test]
     fn test_poker_aa_fails() {
-        // All 5000 nibbles are 0xA → extreme chi-square
         let result = fips_poker(&all_aa());
         assert!(!result.passed);
     }
@@ -366,14 +525,12 @@ mod tests {
 
     #[test]
     fn test_runs_zeros_fails() {
-        // Single run of 20000 zeros → length-1 count is 0
         let result = fips_runs(&all_zeros());
         assert!(!result.passed);
     }
 
     #[test]
     fn test_runs_aa_fails() {
-        // 10000 runs of length 1 for each bit value, way above upper bound
         let result = fips_runs(&all_aa());
         assert!(!result.passed);
     }
@@ -389,7 +546,6 @@ mod tests {
 
     #[test]
     fn test_long_runs_aa_passes() {
-        // Max run is 1 bit
         let result = fips_long_runs(&all_aa());
         assert!(result.passed);
         assert_eq!(result.value, 1.0);
@@ -441,7 +597,6 @@ mod tests {
 
     #[test]
     fn test_serial_correlation_constant() {
-        // All same values → denominator is 0, should return 0.0
         let data = vec![42u8; 1000];
         assert_eq!(serial_correlation(&data), 0.0);
     }
@@ -485,5 +640,125 @@ mod tests {
             "long runs: {}",
             result.long_runs.detail
         );
+    }
+
+    // --- Approximate Entropy ---
+
+    #[test]
+    fn test_approx_entropy_random() {
+        let data = chacha_data();
+        let apen = approximate_entropy(&data, 2);
+        // For random bit-level data, ApEn(m=2) should be near ln(2) ≈ 0.693
+        assert!(apen > 0.5, "expected ApEn near 0.693, got {}", apen);
+        assert!(apen < 0.9, "expected ApEn near 0.693, got {}", apen);
+    }
+
+    #[test]
+    fn test_approx_entropy_constant() {
+        // All-zero bytes produce a constant bit stream (all 0-bits)
+        let data = vec![0u8; 1000];
+        let apen = approximate_entropy(&data, 2);
+        assert!(apen.abs() < 0.01, "expected ~0 for constant bit data, got {}", apen);
+    }
+
+    #[test]
+    fn test_approx_entropy_empty() {
+        assert_eq!(approximate_entropy(&[], 2), 0.0);
+    }
+
+    // --- Multi-lag Autocorrelation ---
+
+    #[test]
+    fn test_autocorrelation_random() {
+        let data = chacha_data();
+        let ac = multi_lag_autocorrelation(&data, 16);
+        assert_eq!(ac.len(), 16);
+        // Random data should have near-zero autocorrelation at all lags
+        for (lag, &val) in ac.iter().enumerate() {
+            assert!(
+                val.abs() < 0.1,
+                "autocorrelation at lag {} = {}, expected near 0",
+                lag + 1,
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn test_autocorrelation_alternating() {
+        let mut data = vec![0u8; 1000];
+        for i in 0..1000 {
+            data[i] = if i % 2 == 0 { 0 } else { 255 };
+        }
+        let ac = multi_lag_autocorrelation(&data, 4);
+        // Lag 1 should be strongly negative
+        assert!(ac[0] < -0.9, "lag-1 should be negative: {}", ac[0]);
+        // Lag 2 should be positive (repeats every 2)
+        assert!(ac[1] > 0.9, "lag-2 should be positive: {}", ac[1]);
+    }
+
+    // --- Lempel-Ziv Complexity ---
+
+    #[test]
+    fn test_lz_complexity_random() {
+        let data = chacha_data();
+        let lz = lempel_ziv_complexity(&data);
+        // Random data: most bytes form new phrases, ratio should be high
+        assert!(lz > 0.7, "expected LZ ratio near 1.0, got {}", lz);
+        assert!(lz < 1.5, "expected LZ ratio near 1.0, got {}", lz);
+    }
+
+    #[test]
+    fn test_lz_complexity_constant() {
+        let data = vec![42u8; 1000];
+        let lz = lempel_ziv_complexity(&data);
+        // Constant data: only ~log(n) phrases, much less than expected
+        assert!(lz < 0.1, "expected low LZ ratio for constant data, got {}", lz);
+    }
+
+    #[test]
+    fn test_lz_complexity_empty() {
+        assert_eq!(lempel_ziv_complexity(&[]), 0.0);
+        assert_eq!(lempel_ziv_complexity(&[42]), 0.0);
+    }
+
+    // --- Block Entropy ---
+
+    #[test]
+    fn test_block_entropy_random() {
+        let data = chacha_data();
+        let be2 = block_entropy(&data, 2);
+        let be4 = block_entropy(&data, 4);
+        // With 4096 bytes: 2048 two-byte blocks from 65536 possible → max ~log2(2048)/2 ≈ 5.5 bits/byte
+        // 1024 four-byte blocks from 2^32 possible → max ~log2(1024)/4 ≈ 2.5 bits/byte
+        assert!(be2 > 5.0, "expected block entropy > 5.0, got {}", be2);
+        assert!(be4 > 2.0, "expected block entropy > 2.0, got {}", be4);
+        // Both should be higher than constant data
+        assert!(be2 > be4, "2-byte blocks should have higher per-byte entropy than 4-byte");
+    }
+
+    #[test]
+    fn test_block_entropy_constant() {
+        let data = vec![42u8; 1000];
+        let be = block_entropy(&data, 2);
+        assert!(be < 0.01, "expected ~0 for constant data, got {}", be);
+    }
+
+    #[test]
+    fn test_block_entropy_empty() {
+        assert_eq!(block_entropy(&[], 2), 0.0);
+    }
+
+    // --- entropy_estimates integration ---
+
+    #[test]
+    fn test_entropy_estimates_complete() {
+        let data = chacha_data();
+        let est = entropy_estimates(&data);
+        assert!(est.shannon > 7.0);
+        assert!(est.min_entropy > 5.0);
+        assert!(est.autocorrelation.len() == 16);
+        assert!(est.compression_ratio > 0.0);
+        assert!(est.block_entropy_2 > 0.0);
     }
 }

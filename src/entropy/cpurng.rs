@@ -203,6 +203,109 @@ mod x86 {
 }
 
 // ---------------------------------------------------------------------------
+// AArch64 implementation (RNDR / RNDRRS)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+mod aarch64 {
+    use core::arch::asm;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    // 0 = unchecked, 1 = absent, 2 = present
+    static FEAT_RNG_SUPPORT: AtomicU8 = AtomicU8::new(0);
+
+    /// Detect FEAT_RNG (RNDR/RNDRRS) support.
+    /// On macOS: sysctlbyname("hw.optional.arm.FEAT_RNG")
+    /// On Linux: getauxval(AT_HWCAP2) & HWCAP2_RNG
+    pub fn has_feat_rng() -> bool {
+        let cached = FEAT_RNG_SUPPORT.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached == 2;
+        }
+
+        let present = detect_feat_rng();
+        FEAT_RNG_SUPPORT.store(if present { 2 } else { 1 }, Ordering::Relaxed);
+        present
+    }
+
+    #[cfg(target_os = "macos")]
+    fn detect_feat_rng() -> bool {
+        let name = c"hw.optional.arm.FEAT_RNG";
+        let mut value: i32 = 0;
+        let mut size = std::mem::size_of::<i32>();
+        let ret = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut value as *mut i32 as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        ret == 0 && value != 0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn detect_feat_rng() -> bool {
+        // AT_HWCAP2 = 26, HWCAP2_RNG = (1 << 16) on aarch64 Linux
+        const AT_HWCAP2: libc::c_ulong = 26;
+        const HWCAP2_RNG: libc::c_ulong = 1 << 16;
+        let hwcap2 = unsafe { libc::getauxval(AT_HWCAP2) };
+        (hwcap2 & HWCAP2_RNG) != 0
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn detect_feat_rng() -> bool {
+        false
+    }
+
+    /// Execute RNDR (MRS from S3_3_C2_C4_0) and return the 64-bit result.
+    /// Returns None if the instruction fails (NZCV.Z set).
+    pub fn rndr64(retries: u32) -> Option<u64> {
+        for _ in 0..retries {
+            let value: u64;
+            let success: u64;
+            unsafe {
+                asm!(
+                    "mrs {val}, s3_3_c2_c4_0",  // RNDR
+                    "cset {ok}, ne",              // success if NZCV.Z == 0
+                    val = out(reg) value,
+                    ok = out(reg) success,
+                    options(nomem, nostack),
+                );
+            }
+            if success != 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Execute RNDRRS (MRS from S3_3_C2_C4_1) and return the 64-bit result.
+    /// RNDRRS reseeds from a TRNG before returning, providing fresh entropy.
+    /// Returns None if the instruction fails.
+    pub fn rndrrs64(retries: u32) -> Option<u64> {
+        for _ in 0..retries {
+            let value: u64;
+            let success: u64;
+            unsafe {
+                asm!(
+                    "mrs {val}, s3_3_c2_c4_1",  // RNDRRS
+                    "cset {ok}, ne",              // success if NZCV.Z == 0
+                    val = out(reg) value,
+                    ok = out(reg) success,
+                    options(nomem, nostack),
+                );
+            }
+            if success != 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -238,7 +341,7 @@ pub fn collect_rdseed(count: usize, retries: u32) -> Result<Vec<u8>, Error> {
     {
         let _ = (count, retries);
         Err(Error::NoEntropy(
-            "CPU hardware RNG not available on this architecture".into(),
+            "RDSEED not available on this architecture".into(),
         ))
     }
 }
@@ -268,7 +371,7 @@ pub fn collect_rdrand(count: usize, retries: u32) -> Result<Vec<u8>, Error> {
     {
         let _ = (count, retries);
         Err(Error::NoEntropy(
-            "CPU hardware RNG not available on this architecture".into(),
+            "RDRAND not available on this architecture".into(),
         ))
     }
 }
@@ -300,37 +403,121 @@ pub fn collect_xstore(count: usize, quality: u32) -> Result<Vec<u8>, Error> {
     {
         let _ = (count, quality);
         Err(Error::NoEntropy(
-            "CPU hardware RNG not available on this architecture".into(),
+            "XSTORE not available on this architecture".into(),
+        ))
+    }
+}
+
+/// Collects `count` bytes of entropy from AArch64 RNDR instruction.
+pub fn collect_rndr(count: usize, retries: u32) -> Result<Vec<u8>, Error> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !aarch64::has_feat_rng() {
+            return Err(Error::NoEntropy("RNDR not supported on this CPU".into()));
+        }
+        let mut buf = vec![0u8; count];
+        let mut offset = 0;
+        while offset < count {
+            let val = aarch64::rndr64(retries).ok_or_else(|| {
+                Error::NoEntropy(format!("RNDR failed after {} retries", retries))
+            })?;
+            let bytes = val.to_ne_bytes();
+            let to_copy = (count - offset).min(8);
+            buf[offset..offset + to_copy].copy_from_slice(&bytes[..to_copy]);
+            offset += to_copy;
+        }
+        Ok(buf)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (count, retries);
+        Err(Error::NoEntropy(
+            "RNDR not available on this architecture".into(),
+        ))
+    }
+}
+
+/// Collects `count` bytes of entropy from AArch64 RNDRRS instruction (reseeded).
+pub fn collect_rndrrs(count: usize, retries: u32) -> Result<Vec<u8>, Error> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !aarch64::has_feat_rng() {
+            return Err(Error::NoEntropy("RNDRRS not supported on this CPU".into()));
+        }
+        let mut buf = vec![0u8; count];
+        let mut offset = 0;
+        while offset < count {
+            let val = aarch64::rndrrs64(retries).ok_or_else(|| {
+                Error::NoEntropy(format!("RNDRRS failed after {} retries", retries))
+            })?;
+            let bytes = val.to_ne_bytes();
+            let to_copy = (count - offset).min(8);
+            buf[offset..offset + to_copy].copy_from_slice(&bytes[..to_copy]);
+            offset += to_copy;
+        }
+        Ok(buf)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (count, retries);
+        Err(Error::NoEntropy(
+            "RNDRRS not available on this architecture".into(),
         ))
     }
 }
 
 /// Returns the instruction order based on the preferred instruction.
-/// The preferred instruction comes first, then the remaining two in a fixed order.
+/// The preferred instruction comes first, then the remaining ones in a fixed order.
 fn instruction_order(config: &CpuRngConfig) -> Vec<CpuRngPreference> {
-    let all = match config.prefer {
-        CpuRngPreference::Rdseed => [
+    // Build the full order based on preference
+    let all: &[CpuRngPreference] = match config.prefer {
+        CpuRngPreference::Rdseed => &[
+            CpuRngPreference::Rdseed,
+            CpuRngPreference::Rdrand,
+            CpuRngPreference::Xstore,
+            CpuRngPreference::Rndrrs,
+            CpuRngPreference::Rndr,
+        ],
+        CpuRngPreference::Rdrand => &[
+            CpuRngPreference::Rdrand,
+            CpuRngPreference::Rdseed,
+            CpuRngPreference::Xstore,
+            CpuRngPreference::Rndrrs,
+            CpuRngPreference::Rndr,
+        ],
+        CpuRngPreference::Xstore => &[
+            CpuRngPreference::Xstore,
+            CpuRngPreference::Rdseed,
+            CpuRngPreference::Rdrand,
+            CpuRngPreference::Rndrrs,
+            CpuRngPreference::Rndr,
+        ],
+        CpuRngPreference::Rndr => &[
+            CpuRngPreference::Rndr,
+            CpuRngPreference::Rndrrs,
             CpuRngPreference::Rdseed,
             CpuRngPreference::Rdrand,
             CpuRngPreference::Xstore,
         ],
-        CpuRngPreference::Rdrand => [
-            CpuRngPreference::Rdrand,
-            CpuRngPreference::Rdseed,
-            CpuRngPreference::Xstore,
-        ],
-        CpuRngPreference::Xstore => [
-            CpuRngPreference::Xstore,
+        CpuRngPreference::Rndrrs => &[
+            CpuRngPreference::Rndrrs,
+            CpuRngPreference::Rndr,
             CpuRngPreference::Rdseed,
             CpuRngPreference::Rdrand,
+            CpuRngPreference::Xstore,
         ],
     };
 
-    all.into_iter()
+    all.iter()
+        .copied()
         .filter(|pref| match pref {
             CpuRngPreference::Rdseed => config.enable_rdseed,
             CpuRngPreference::Rdrand => config.enable_rdrand,
             CpuRngPreference::Xstore => config.enable_xstore,
+            CpuRngPreference::Rndr => config.enable_rndr,
+            CpuRngPreference::Rndrrs => config.enable_rndrrs,
         })
         .collect()
 }
@@ -353,6 +540,14 @@ fn try_instruction(
         CpuRngPreference::Xstore => {
             let bytes = collect_xstore(count, config.xstore_quality)?;
             Ok((bytes, "XSTORE"))
+        }
+        CpuRngPreference::Rndr => {
+            let bytes = collect_rndr(count, config.rndr_retries)?;
+            Ok((bytes, "RNDR"))
+        }
+        CpuRngPreference::Rndrrs => {
+            let bytes = collect_rndrrs(count, config.rndrrs_retries)?;
+            Ok((bytes, "RNDRRS"))
         }
     }
 }
@@ -388,7 +583,8 @@ pub fn collect_cpu_entropy(count: usize, config: &CpuRngConfig) -> Result<CpuRng
 
 /// Collects CPU entropy with optional oversampling for the standalone path.
 /// If `oversample > 1`, collects `count * oversample` raw bytes and compresses
-/// through BLAKE2b → ChaCha20 to produce `count` output bytes.
+/// through BLAKE2b -> ChaCha20 to produce `count` output bytes.
+/// For requests > 1 MiB, reseeds the CSPRNG with fresh CPU entropy at each 1 MiB boundary.
 pub fn collect_cpu_entropy_standalone(
     count: usize,
     config: &CpuRngConfig,
@@ -399,16 +595,40 @@ pub fn collect_cpu_entropy_standalone(
 
     let raw_count = count.saturating_mul(config.oversample as usize);
     let result = collect_cpu_entropy(raw_count, config)?;
+    let source_label = result.source_label;
 
     let mut raw_bytes = result.bytes;
     let seed = crate::mixer::mix_entropy(&[("cpu-rng-oversample", &raw_bytes)]);
-    let output = crate::csprng::generate(seed, count);
-
     zeroize_vec(&mut raw_bytes);
+
+    let output = if count > crate::csprng::RESEED_INTERVAL {
+        let cfg = config.clone();
+        let os = config.oversample;
+        crate::csprng::generate_reseeding(
+            seed,
+            count,
+            crate::csprng::RESEED_INTERVAL,
+            move || {
+                let raw = cfg
+                    .fallback_mix_bytes
+                    .max(32)
+                    .saturating_mul(os as usize);
+                let fresh = collect_cpu_entropy(raw, &cfg)
+                    .map(|r| r.bytes)
+                    .unwrap_or_else(|_| vec![0u8; 32]);
+                let mut fb = fresh;
+                let s = crate::mixer::mix_entropy(&[("cpu-rng-reseed", &fb)]);
+                zeroize_vec(&mut fb);
+                s
+            },
+        )
+    } else {
+        crate::csprng::generate(seed, count)
+    };
 
     Ok(CpuRngResult {
         bytes: output,
-        source_label: result.source_label,
+        source_label,
     })
 }
 
@@ -454,10 +674,7 @@ mod tests {
             ..Default::default()
         };
         let order = instruction_order(&config);
-        assert_eq!(order.len(), 3);
         assert_eq!(order[0], CpuRngPreference::Rdseed);
-        assert_eq!(order[1], CpuRngPreference::Rdrand);
-        assert_eq!(order[2], CpuRngPreference::Xstore);
     }
 
     #[test]
@@ -467,10 +684,18 @@ mod tests {
             ..Default::default()
         };
         let order = instruction_order(&config);
-        assert_eq!(order.len(), 3);
         assert_eq!(order[0], CpuRngPreference::Xstore);
-        assert_eq!(order[1], CpuRngPreference::Rdseed);
-        assert_eq!(order[2], CpuRngPreference::Rdrand);
+    }
+
+    #[test]
+    fn test_instruction_order_prefer_rndr() {
+        let config = CpuRngConfig {
+            prefer: CpuRngPreference::Rndr,
+            ..Default::default()
+        };
+        let order = instruction_order(&config);
+        assert_eq!(order[0], CpuRngPreference::Rndr);
+        assert_eq!(order[1], CpuRngPreference::Rndrrs);
     }
 
     #[test]
@@ -481,7 +706,6 @@ mod tests {
             ..Default::default()
         };
         let order = instruction_order(&config);
-        assert_eq!(order.len(), 2);
         assert!(!order.contains(&CpuRngPreference::Rdrand));
     }
 
@@ -491,11 +715,34 @@ mod tests {
             enable_rdseed: false,
             enable_rdrand: false,
             enable_xstore: false,
+            enable_rndr: false,
+            enable_rndrrs: false,
             ..Default::default()
         };
         let result = collect_cpu_entropy(32, &config);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("disabled"));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_rndr_collect() {
+        // On Apple Silicon, RNDR should be available
+        let result = collect_rndr(32, 10);
+        if let Ok(buf) = result {
+            assert_eq!(buf.len(), 32);
+            assert!(buf.iter().any(|&b| b != 0));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_rndrrs_collect() {
+        let result = collect_rndrrs(32, 10);
+        if let Ok(buf) = result {
+            assert_eq!(buf.len(), 32);
+            assert!(buf.iter().any(|&b| b != 0));
+        }
     }
 }

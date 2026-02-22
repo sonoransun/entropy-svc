@@ -1,52 +1,16 @@
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::cli::CheckArgs;
+use serde::Serialize;
+
+use crate::cli::{CheckArgs, CheckOutputFormat};
 use crate::config::CpuRngConfig;
-use crate::entropy::{cpurng, fallback, haveged, hwrng};
+use crate::entropy::{self, EntropySource};
 use crate::error::Error;
 use crate::stats;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
-    Hwrng,
-    Rdseed,
-    Rdrand,
-    Xstore,
-    Haveged,
-    Urandom,
-    Fallback,
-}
-
-impl SourceKind {
-    fn name(&self) -> &'static str {
-        match self {
-            SourceKind::Hwrng => "hwrng",
-            SourceKind::Rdseed => "rdseed",
-            SourceKind::Rdrand => "rdrand",
-            SourceKind::Xstore => "xstore",
-            SourceKind::Haveged => "haveged",
-            SourceKind::Urandom => "urandom",
-            SourceKind::Fallback => "fallback",
-        }
-    }
-
-    fn description(&self) -> &'static str {
-        match self {
-            SourceKind::Hwrng => "Hardware RNG (/dev/hwrng)",
-            SourceKind::Rdseed => "CPU RDSEED instruction",
-            SourceKind::Rdrand => "CPU RDRAND instruction",
-            SourceKind::Xstore => "VIA PadLock XSTORE instruction",
-            SourceKind::Haveged => "haveged (/dev/random)",
-            SourceKind::Urandom => "/dev/urandom",
-            SourceKind::Fallback => "Fallback (urandom + procfs + jitter + cpu-rng)",
-        }
-    }
-}
 
 struct SourceStats {
     total_samples: u64,
@@ -62,6 +26,11 @@ struct SourceStats {
     chi_square_sum: f64,
     mean_sum: f64,
     serial_corr_sum: f64,
+    approx_entropy_m2_sum: f64,
+    approx_entropy_m3_sum: f64,
+    compression_ratio_sum: f64,
+    block_entropy_2_sum: f64,
+    block_entropy_4_sum: f64,
     errors: u64,
 }
 
@@ -81,6 +50,11 @@ impl SourceStats {
             chi_square_sum: 0.0,
             mean_sum: 0.0,
             serial_corr_sum: 0.0,
+            approx_entropy_m2_sum: 0.0,
+            approx_entropy_m3_sum: 0.0,
+            compression_ratio_sum: 0.0,
+            block_entropy_2_sum: 0.0,
+            block_entropy_4_sum: 0.0,
             errors: 0,
         }
     }
@@ -108,28 +82,71 @@ impl SourceStats {
     }
 }
 
-fn collect_sample(
-    source: &SourceKind,
-    count: usize,
-    config: &CpuRngConfig,
-) -> Result<Vec<u8>, Error> {
-    match source {
-        SourceKind::Hwrng => hwrng::read_hwrng(count),
-        SourceKind::Rdseed => cpurng::collect_rdseed(count, config.rdseed_retries),
-        SourceKind::Rdrand => cpurng::collect_rdrand(count, config.rdrand_retries),
-        SourceKind::Xstore => cpurng::collect_xstore(count, config.xstore_quality),
-        SourceKind::Haveged => haveged::read_haveged(count),
-        SourceKind::Urandom => read_urandom(count),
-        SourceKind::Fallback => fallback::generate_fallback(count, config),
-    }
+/// Serializable result for a single source (used for JSON/CSV output).
+#[derive(Serialize)]
+struct SourceResult {
+    name: String,
+    description: String,
+    samples: u64,
+    bytes: u64,
+    throughput_bytes_per_sec: f64,
+    errors: u64,
+    fips_monobit_pct: f64,
+    fips_poker_pct: f64,
+    fips_runs_pct: f64,
+    fips_long_runs_pct: f64,
+    fips_all_pct: f64,
+    shannon: f64,
+    min_entropy: f64,
+    chi_square: f64,
+    chi_square_p: f64,
+    mean: f64,
+    serial_correlation: f64,
+    approx_entropy_m2: f64,
+    approx_entropy_m3: f64,
+    compression_ratio: f64,
+    block_entropy_2: f64,
+    block_entropy_4: f64,
 }
 
-fn read_urandom(count: usize) -> Result<Vec<u8>, Error> {
-    let mut f = File::open("/dev/urandom")
-        .map_err(|e| Error::NoEntropy(format!("/dev/urandom not available: {}", e)))?;
-    let mut buf = vec![0u8; count];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
+/// Top-level serializable check result.
+#[derive(Serialize)]
+struct CheckResult {
+    duration_secs: f64,
+    sample_size: usize,
+    fips_enabled: bool,
+    sources: Vec<SourceResult>,
+}
+
+fn build_source_result(
+    source: &dyn EntropySource,
+    stat: &SourceStats,
+) -> SourceResult {
+    let chi = stat.avg(stat.chi_square_sum);
+    SourceResult {
+        name: source.name().to_string(),
+        description: source.description().to_string(),
+        samples: stat.total_samples,
+        bytes: stat.total_bytes,
+        throughput_bytes_per_sec: stat.throughput_bytes_per_sec(),
+        errors: stat.errors,
+        fips_monobit_pct: stat.fips_pass_pct(stat.fips_monobit_pass),
+        fips_poker_pct: stat.fips_pass_pct(stat.fips_poker_pass),
+        fips_runs_pct: stat.fips_pass_pct(stat.fips_runs_pass),
+        fips_long_runs_pct: stat.fips_pass_pct(stat.fips_long_runs_pass),
+        fips_all_pct: stat.fips_pass_pct(stat.fips_all_pass),
+        shannon: stat.avg(stat.shannon_sum),
+        min_entropy: stat.avg(stat.min_entropy_sum),
+        chi_square: chi,
+        chi_square_p: stats::chi_square_p_value(chi, 255.0),
+        mean: stat.avg(stat.mean_sum),
+        serial_correlation: stat.avg(stat.serial_corr_sum),
+        approx_entropy_m2: stat.avg(stat.approx_entropy_m2_sum),
+        approx_entropy_m3: stat.avg(stat.approx_entropy_m3_sum),
+        compression_ratio: stat.avg(stat.compression_ratio_sum),
+        block_entropy_2: stat.avg(stat.block_entropy_2_sum),
+        block_entropy_4: stat.avg(stat.block_entropy_4_sum),
+    }
 }
 
 fn parse_duration(s: &str) -> Result<Duration, Error> {
@@ -205,7 +222,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 extern "C" fn signal_handler(_sig: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::Relaxed);
+    SHUTDOWN.store(true, Ordering::Release);
 }
 
 fn install_signal_handlers() {
@@ -219,25 +236,18 @@ fn install_signal_handlers() {
     }
 }
 
-fn probe_sources(cpu_config: &CpuRngConfig) -> Vec<SourceKind> {
-    let candidates = [
-        SourceKind::Hwrng,
-        SourceKind::Rdseed,
-        SourceKind::Rdrand,
-        SourceKind::Xstore,
-        SourceKind::Haveged,
-        SourceKind::Urandom,
-        SourceKind::Fallback,
-    ];
-
+/// Probe all sources, printing availability status and returning available ones.
+fn probe_sources(
+    all_sources: Vec<Box<dyn EntropySource>>,
+) -> Vec<Box<dyn EntropySource>> {
     let mut available = Vec::new();
 
-    for &kind in &candidates {
-        eprint!("  {:10} ... ", kind.name());
-        match collect_sample(&kind, 32, cpu_config) {
+    for source in all_sources {
+        eprint!("  {:10} ... ", source.name());
+        match source.collect(32) {
             Ok(_) => {
                 eprintln!("[ok]");
-                available.push(kind);
+                available.push(source);
             }
             Err(e) => {
                 eprintln!("[skip] {}", e);
@@ -249,7 +259,8 @@ fn probe_sources(cpu_config: &CpuRngConfig) -> Vec<SourceKind> {
 }
 
 fn print_progress(
-    stats_vec: &[(SourceKind, SourceStats)],
+    sources: &[Box<dyn EntropySource>],
+    stats: &[SourceStats],
     elapsed: Duration,
     total: Duration,
     do_fips: bool,
@@ -282,7 +293,7 @@ fn print_progress(
         .ok();
     }
 
-    for (kind, stat) in stats_vec {
+    for (source, stat) in sources.iter().zip(stats.iter()) {
         let throughput = format_throughput(stat.throughput_bytes_per_sec());
         let shannon = stat.avg(stat.shannon_sum);
 
@@ -291,7 +302,7 @@ fn print_progress(
             writeln!(
                 stderr,
                 "{:<12} {:>8} {:>9.1}% {:>8.3} {:>12} {:>7}",
-                kind.name(),
+                source.name(),
                 stat.total_samples,
                 fips_pct,
                 shannon,
@@ -303,7 +314,7 @@ fn print_progress(
             writeln!(
                 stderr,
                 "{:<12} {:>8} {:>8.3} {:>12} {:>7}",
-                kind.name(),
+                source.name(),
                 stat.total_samples,
                 shannon,
                 throughput,
@@ -315,10 +326,14 @@ fn print_progress(
     writeln!(stderr).ok();
 }
 
-fn print_final_report(stats_vec: &[(SourceKind, SourceStats)], do_fips: bool) {
+fn print_final_report(
+    sources: &[Box<dyn EntropySource>],
+    stats_vec: &[SourceStats],
+    do_fips: bool,
+) {
     // Per-source detailed results
-    for (kind, stat) in stats_vec {
-        println!("--- {} ({}) ---", kind.name(), kind.description());
+    for (source, stat) in sources.iter().zip(stats_vec.iter()) {
+        println!("--- {} ({}) ---", source.name(), source.description());
         println!(
             "  Samples: {} | Bytes: {} | Throughput: {} | Errors: {}",
             stat.total_samples,
@@ -348,16 +363,27 @@ fn print_final_report(stats_vec: &[(SourceKind, SourceStats)], do_fips: bool) {
                 p
             );
             println!(
-                "               Mean {:.2}     SerCorr {:.3}",
+                "               Mean {:.2}     SerCorr {:.4}",
                 stat.avg(stat.mean_sum),
                 stat.avg(stat.serial_corr_sum)
+            );
+            println!(
+                "  Advanced:    ApEn(m=2) {:.4}  ApEn(m=3) {:.4}  LZ ratio {:.3}",
+                stat.avg(stat.approx_entropy_m2_sum),
+                stat.avg(stat.approx_entropy_m3_sum),
+                stat.avg(stat.compression_ratio_sum)
+            );
+            println!(
+                "               BlkEnt(2) {:.3}  BlkEnt(4) {:.3}",
+                stat.avg(stat.block_entropy_2_sum),
+                stat.avg(stat.block_entropy_4_sum)
             );
         }
         println!();
     }
 
     // Comparison table (only if multiple sources)
-    if stats_vec.len() > 1 {
+    if sources.len() > 1 {
         println!("--- Comparison ---");
         if do_fips {
             println!(
@@ -371,7 +397,7 @@ fn print_final_report(stats_vec: &[(SourceKind, SourceStats)], do_fips: bool) {
             );
         }
 
-        for (kind, stat) in stats_vec {
+        for (source, stat) in sources.iter().zip(stats_vec.iter()) {
             let throughput = format_throughput(stat.throughput_bytes_per_sec());
             let shannon = stat.avg(stat.shannon_sum);
             let min_ent = stat.avg(stat.min_entropy_sum);
@@ -380,7 +406,7 @@ fn print_final_report(stats_vec: &[(SourceKind, SourceStats)], do_fips: bool) {
                 let fips_pct = stat.fips_pass_pct(stat.fips_all_pass);
                 println!(
                     "{:<12} {:>12} {:>9.1}% {:>8.3} {:>8.3}",
-                    kind.name(),
+                    source.name(),
                     throughput,
                     fips_pct,
                     shannon,
@@ -389,7 +415,7 @@ fn print_final_report(stats_vec: &[(SourceKind, SourceStats)], do_fips: bool) {
             } else {
                 println!(
                     "{:<12} {:>12} {:>8.3} {:>8.3}",
-                    kind.name(),
+                    source.name(),
                     throughput,
                     shannon,
                     min_ent
@@ -399,8 +425,9 @@ fn print_final_report(stats_vec: &[(SourceKind, SourceStats)], do_fips: bool) {
         println!();
 
         // Verdict
-        let best_throughput = stats_vec
+        let best_throughput = sources
             .iter()
+            .zip(stats_vec.iter())
             .filter(|(_, s)| s.total_samples > 0)
             .max_by(|a, b| {
                 a.1.throughput_bytes_per_sec()
@@ -408,8 +435,9 @@ fn print_final_report(stats_vec: &[(SourceKind, SourceStats)], do_fips: bool) {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-        let best_min_entropy = stats_vec
+        let best_min_entropy = sources
             .iter()
+            .zip(stats_vec.iter())
             .filter(|(_, s)| s.total_samples > 0)
             .max_by(|a, b| {
                 a.1.avg(a.1.min_entropy_sum)
@@ -418,20 +446,64 @@ fn print_final_report(stats_vec: &[(SourceKind, SourceStats)], do_fips: bool) {
             });
 
         println!("Verdict:");
-        if let Some((kind, stat)) = best_throughput {
+        if let Some((source, stat)) = best_throughput {
             println!(
                 "  Highest throughput:   {} ({})",
-                kind.name(),
+                source.name(),
                 format_throughput(stat.throughput_bytes_per_sec())
             );
         }
-        if let Some((kind, stat)) = best_min_entropy {
+        if let Some((source, stat)) = best_min_entropy {
             println!(
                 "  Highest min-entropy:  {} ({:.3} bits/byte)",
-                kind.name(),
+                source.name(),
                 stat.avg(stat.min_entropy_sum)
             );
         }
+    }
+}
+
+fn output_json(
+    sources: &[Box<dyn EntropySource>],
+    stats_vec: &[SourceStats],
+    total_elapsed: Duration,
+    sample_size: usize,
+    do_fips: bool,
+) {
+    let result = CheckResult {
+        duration_secs: total_elapsed.as_secs_f64(),
+        sample_size,
+        fips_enabled: do_fips,
+        sources: sources
+            .iter()
+            .zip(stats_vec.iter())
+            .map(|(s, st)| build_source_result(s.as_ref(), st))
+            .collect(),
+    };
+    println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+}
+
+fn output_csv(
+    sources: &[Box<dyn EntropySource>],
+    stats_vec: &[SourceStats],
+) {
+    println!(
+        "source,samples,bytes,throughput_bps,errors,\
+         fips_monobit_pct,fips_poker_pct,fips_runs_pct,fips_long_runs_pct,fips_all_pct,\
+         shannon,min_entropy,chi_square,chi_square_p,mean,serial_correlation,\
+         approx_entropy_m2,approx_entropy_m3,compression_ratio,block_entropy_2,block_entropy_4"
+    );
+    for (source, stat) in sources.iter().zip(stats_vec.iter()) {
+        let r = build_source_result(source.as_ref(), stat);
+        println!(
+            "{},{},{},{:.2},{},{:.1},{:.1},{:.1},{:.1},{:.1},\
+             {:.4},{:.4},{:.1},{:.4},{:.2},{:.6},\
+             {:.4},{:.4},{:.4},{:.4},{:.4}",
+            r.name, r.samples, r.bytes, r.throughput_bytes_per_sec, r.errors,
+            r.fips_monobit_pct, r.fips_poker_pct, r.fips_runs_pct, r.fips_long_runs_pct, r.fips_all_pct,
+            r.shannon, r.min_entropy, r.chi_square, r.chi_square_p, r.mean, r.serial_correlation,
+            r.approx_entropy_m2, r.approx_entropy_m3, r.compression_ratio, r.block_entropy_2, r.block_entropy_4
+        );
     }
 }
 
@@ -449,9 +521,11 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     install_signal_handlers();
 
     eprintln!("Probing entropy sources...");
-    let sources = probe_sources(cpu_config);
+    let all_sources = entropy::build_check_sources(cpu_config);
+    let sources = probe_sources(all_sources);
 
-    let sources: Vec<SourceKind> = if let Some(ref names) = args.sources {
+    // Filter by user-requested sources
+    let sources: Vec<Box<dyn EntropySource>> = if let Some(ref names) = args.sources {
         sources
             .into_iter()
             .filter(|s| names.iter().any(|n| n.eq_ignore_ascii_case(s.name())))
@@ -473,8 +547,7 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     );
     eprintln!();
 
-    let mut stats_vec: Vec<(SourceKind, SourceStats)> =
-        sources.iter().map(|&s| (s, SourceStats::new())).collect();
+    let mut stats_vec: Vec<SourceStats> = sources.iter().map(|_| SourceStats::new()).collect();
 
     let start = Instant::now();
     let deadline = start + duration;
@@ -482,17 +555,16 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
 
     'outer: loop {
         for i in 0..sources.len() {
-            if SHUTDOWN.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            if SHUTDOWN.load(Ordering::Acquire) || Instant::now() >= deadline {
                 break 'outer;
             }
 
-            let source = &sources[i];
             let sample_start = Instant::now();
 
-            match collect_sample(source, args.sample_size, cpu_config) {
+            match sources[i].collect(args.sample_size) {
                 Ok(data) => {
                     let elapsed = sample_start.elapsed();
-                    let stat = &mut stats_vec[i].1;
+                    let stat = &mut stats_vec[i];
                     stat.total_samples += 1;
                     stat.total_bytes += data.len() as u64;
                     stat.total_time += elapsed;
@@ -523,14 +595,19 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
                     stat.chi_square_sum += est.chi_square;
                     stat.mean_sum += est.mean;
                     stat.serial_corr_sum += est.serial_correlation;
+                    stat.approx_entropy_m2_sum += est.approx_entropy_m2;
+                    stat.approx_entropy_m3_sum += est.approx_entropy_m3;
+                    stat.compression_ratio_sum += est.compression_ratio;
+                    stat.block_entropy_2_sum += est.block_entropy_2;
+                    stat.block_entropy_4_sum += est.block_entropy_4;
                 }
                 Err(_) => {
-                    stats_vec[i].1.errors += 1;
+                    stats_vec[i].errors += 1;
                 }
             }
 
             if last_report.elapsed().as_secs() >= args.report_interval {
-                print_progress(&stats_vec, start.elapsed(), duration, do_fips);
+                print_progress(&sources, &stats_vec, start.elapsed(), duration, do_fips);
                 last_report = Instant::now();
             }
         }
@@ -538,7 +615,7 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
 
     let total_elapsed = start.elapsed();
 
-    if SHUTDOWN.load(Ordering::Relaxed) {
+    if SHUTDOWN.load(Ordering::Acquire) {
         eprintln!(
             "\nInterrupted after {} — printing partial results\n",
             format_duration(total_elapsed)
@@ -547,7 +624,150 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
         eprintln!("\nCompleted {} check\n", format_duration(total_elapsed));
     }
 
-    print_final_report(&stats_vec, do_fips);
+    match args.output_format {
+        CheckOutputFormat::Json => output_json(&sources, &stats_vec, total_elapsed, args.sample_size, do_fips),
+        CheckOutputFormat::Csv => output_csv(&sources, &stats_vec),
+        CheckOutputFormat::Text => print_final_report(&sources, &stats_vec, do_fips),
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_duration ---
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_parse_duration_minutes() {
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_parse_duration_days() {
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn test_parse_duration_bare_number() {
+        // Bare number = minutes
+        assert_eq!(parse_duration("5").unwrap(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_parse_duration_zero() {
+        assert!(parse_duration("0s").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_empty() {
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_invalid() {
+        assert!(parse_duration("abcs").is_err());
+    }
+
+    // --- format_duration ---
+
+    #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(30)), "30s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(120)), "2m");
+    }
+
+    #[test]
+    fn test_format_duration_minutes_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h");
+    }
+
+    #[test]
+    fn test_format_duration_hours_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(5400)), "1h 30m");
+    }
+
+    // --- format_throughput ---
+
+    #[test]
+    fn test_format_throughput_bytes() {
+        assert_eq!(format_throughput(100.0), "100 B/s");
+    }
+
+    #[test]
+    fn test_format_throughput_kb() {
+        assert_eq!(format_throughput(5000.0), "5.00 KB/s");
+    }
+
+    #[test]
+    fn test_format_throughput_mb() {
+        assert_eq!(format_throughput(2_500_000.0), "2.50 MB/s");
+    }
+
+    // --- format_bytes ---
+
+    #[test]
+    fn test_format_bytes_small() {
+        assert_eq!(format_bytes(500), "500 B");
+    }
+
+    #[test]
+    fn test_format_bytes_kb() {
+        assert_eq!(format_bytes(5000), "5.00 KB");
+    }
+
+    #[test]
+    fn test_format_bytes_mb() {
+        assert_eq!(format_bytes(2_500_000), "2.50 MB");
+    }
+
+    // --- SourceStats ---
+
+    #[test]
+    fn test_source_stats_empty() {
+        let stat = SourceStats::new();
+        assert_eq!(stat.fips_pass_pct(0), 0.0);
+        assert_eq!(stat.avg(0.0), 0.0);
+        assert_eq!(stat.throughput_bytes_per_sec(), 0.0);
+        assert_eq!(stat.approx_entropy_m2_sum, 0.0);
+        assert_eq!(stat.compression_ratio_sum, 0.0);
+    }
+
+    #[test]
+    fn test_source_stats_computations() {
+        let mut stat = SourceStats::new();
+        stat.total_samples = 10;
+        stat.total_bytes = 25000;
+        stat.total_time = Duration::from_secs(5);
+        stat.fips_all_pass = 8;
+        stat.shannon_sum = 75.0;
+        stat.approx_entropy_m2_sum = 6.93;
+        stat.compression_ratio_sum = 9.5;
+
+        assert!((stat.fips_pass_pct(8) - 80.0).abs() < f64::EPSILON);
+        assert!((stat.avg(75.0) - 7.5).abs() < f64::EPSILON);
+        assert!((stat.throughput_bytes_per_sec() - 5000.0).abs() < f64::EPSILON);
+        assert!((stat.avg(stat.approx_entropy_m2_sum) - 0.693).abs() < 0.001);
+        assert!((stat.avg(stat.compression_ratio_sum) - 0.95).abs() < 0.001);
+    }
 }
