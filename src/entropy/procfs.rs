@@ -1,18 +1,34 @@
-use std::fs;
-
-/// Reads raw bytes from /proc/interrupts.
+/// Reads raw bytes from /proc/interrupts (Linux only).
+#[cfg(target_os = "linux")]
 pub fn read_interrupts() -> Vec<u8> {
-    fs::read("/proc/interrupts").unwrap_or_default()
+    std::fs::read("/proc/interrupts").unwrap_or_default()
 }
 
-/// Reads raw bytes from /proc/stat.
+#[cfg(not(target_os = "linux"))]
+pub fn read_interrupts() -> Vec<u8> {
+    Vec::new()
+}
+
+/// Reads raw bytes from /proc/stat (Linux only).
+#[cfg(target_os = "linux")]
 pub fn read_stat() -> Vec<u8> {
-    fs::read("/proc/stat").unwrap_or_default()
+    std::fs::read("/proc/stat").unwrap_or_default()
 }
 
-/// Reads raw bytes from /proc/diskstats.
+#[cfg(not(target_os = "linux"))]
+pub fn read_stat() -> Vec<u8> {
+    Vec::new()
+}
+
+/// Reads raw bytes from /proc/diskstats (Linux only).
+#[cfg(target_os = "linux")]
 pub fn read_diskstats() -> Vec<u8> {
-    fs::read("/proc/diskstats").unwrap_or_default()
+    std::fs::read("/proc/diskstats").unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_diskstats() -> Vec<u8> {
+    Vec::new()
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
 
 /// Lock a byte slice into physical memory (prevent swapping).
 /// Logs a warning and returns false if mlock fails.
+#[cfg(unix)]
 pub fn mlock_slice(buf: &[u8]) -> bool {
     if buf.is_empty() {
         return true;
@@ -22,7 +23,13 @@ pub fn mlock_slice(buf: &[u8]) -> bool {
     true
 }
 
+#[cfg(not(unix))]
+pub fn mlock_slice(_buf: &[u8]) -> bool {
+    true // no-op on non-Unix platforms
+}
+
 /// Unlock a previously mlocked byte slice.
+#[cfg(unix)]
 pub fn munlock_slice(buf: &[u8]) {
     if buf.is_empty() {
         return;
@@ -31,6 +38,9 @@ pub fn munlock_slice(buf: &[u8]) {
         libc::munlock(buf.as_ptr() as *const libc::c_void, buf.len());
     }
 }
+
+#[cfg(not(unix))]
+pub fn munlock_slice(_buf: &[u8]) {}
 
 /// Mark a byte slice as excluded from core dumps via madvise(MADV_DONTDUMP).
 /// This is Linux-specific; on other platforms it is a no-op.

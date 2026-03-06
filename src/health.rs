@@ -5,7 +5,6 @@
 /// - **Adaptive Proportion Test**: detects bias toward one value within a sliding window
 ///
 /// Health test state for a single entropy source.
-#[allow(dead_code)]
 pub struct HealthTester {
     // Repetition Count Test state
     rct_last_value: u64,
@@ -25,7 +24,6 @@ pub struct HealthTester {
     total_samples: u64,
 }
 
-#[allow(dead_code)]
 impl HealthTester {
     /// Create a new health tester.
     ///
@@ -105,21 +103,25 @@ impl HealthTester {
     }
 
     /// Returns the number of RCT failures.
+    #[allow(dead_code)]
     pub fn rct_failures(&self) -> u64 {
         self.rct_failures
     }
 
     /// Returns the number of APT failures.
+    #[allow(dead_code)]
     pub fn apt_failures(&self) -> u64 {
         self.apt_failures
     }
 
     /// Returns the total number of samples processed.
+    #[allow(dead_code)]
     pub fn total_samples(&self) -> u64 {
         self.total_samples
     }
 
     /// Returns true if any health test has failed.
+    #[allow(dead_code)]
     pub fn has_failures(&self) -> bool {
         self.rct_failures > 0 || self.apt_failures > 0
     }

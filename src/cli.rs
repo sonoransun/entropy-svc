@@ -8,23 +8,23 @@ use crate::logging::LogArgs;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum OutputFormat {
-    /// Hexadecimal (lowercase)
+    /// Hexadecimal lowercase (default, e.g. a1b2c3)
     Hex,
-    /// Raw binary bytes
+    /// Raw binary bytes (no encoding, for piping to files or tools)
     Raw,
-    /// Base64 (standard, with padding)
+    /// Base64 standard encoding with padding
     Base64,
-    /// Base64 URL-safe (no padding)
+    /// Base64 URL-safe (no padding, uses - and _ instead of + and /)
     Base64url,
-    /// uuencode format
+    /// uuencode format (traditional Unix encoding, compatible with uudecode)
     Uuencode,
-    /// Printable ASCII text (alphanumeric + symbols)
+    /// Printable ASCII text (94 chars: ! through ~, suitable for passwords)
     Text,
-    /// Octal bytes separated by spaces
+    /// Octal bytes separated by spaces (e.g. 241 262 303)
     Octal,
-    /// Binary bit strings separated by spaces
+    /// Binary bit strings separated by spaces (e.g. 10100001 10110010)
     Binary,
-    /// Uppercase hexadecimal
+    /// Hexadecimal uppercase (e.g. A1B2C3)
     HexUpper,
 }
 
@@ -98,8 +98,19 @@ pub struct CpuRngArgs {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "mixrand", about = "Secure random byte generator")]
+#[command(name = "mixrand", about = "Secure random byte generator", version)]
 #[command(args_conflicts_with_subcommands = true)]
+#[command(after_long_help = "\
+Examples:
+  mixrand -n 32                  Generate 32 random bytes (hex)
+  mixrand -n 64 -f raw > key     Write 64 raw bytes to file
+  mixrand -n 16 -f base64        Generate 16 bytes as base64
+  mixrand -n 32 -f text          Generate a 32-char printable password
+  mixrand --count 5 -n 32        Generate 5 independent 32-byte values
+  mixrand check -d 30s           Run statistical tests for 30 seconds
+  mixrand list-sources           Show available entropy sources
+  mixrand daemon -t 512 -i 10    Run entropy daemon (Linux, requires root)
+  mixrand completions bash       Generate bash completions")]
 pub struct Cli {
     /// Number of random bytes to generate
     #[arg(short = 'n', long = "bytes", default_value_t = 32)]
@@ -209,6 +220,10 @@ pub struct CheckArgs {
     /// Comma-separated list of sources to test (default: all available)
     #[arg(long, value_delimiter = ',')]
     pub sources: Option<Vec<String>>,
+
+    /// Suppress progress output (only print final results)
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 
     /// Output format for results
     #[arg(long = "output-format", value_enum, default_value_t = CheckOutputFormat::Text)]

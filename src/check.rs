@@ -221,14 +221,16 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+#[cfg(unix)]
 extern "C" fn signal_handler(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
 fn install_signal_handlers() {
+    #[cfg(unix)]
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = signal_handler as *const () as usize;
+        sa.sa_sigaction = signal_handler as *const () as libc::sighandler_t;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
@@ -239,18 +241,25 @@ fn install_signal_handlers() {
 /// Probe all sources, printing availability status and returning available ones.
 fn probe_sources(
     all_sources: Vec<Box<dyn EntropySource>>,
+    quiet: bool,
 ) -> Vec<Box<dyn EntropySource>> {
     let mut available = Vec::new();
 
     for source in all_sources {
-        eprint!("  {:10} ... ", source.name());
+        if !quiet {
+            eprint!("  {:10} ... ", source.name());
+        }
         match source.collect(32) {
             Ok(_) => {
-                eprintln!("[ok]");
+                if !quiet {
+                    eprintln!("[ok]");
+                }
                 available.push(source);
             }
             Err(e) => {
-                eprintln!("[skip] {}", e);
+                if !quiet {
+                    eprintln!("[skip] {}", e);
+                }
             }
         }
     }
@@ -511,7 +520,9 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     let duration = parse_duration(&args.duration)?;
     let do_fips = args.sample_size >= 2500;
 
-    if !do_fips {
+    let quiet = args.quiet;
+
+    if !do_fips && !quiet {
         eprintln!(
             "Warning: sample_size {} < 2500 bytes, FIPS 140-2 tests will be skipped",
             args.sample_size
@@ -520,9 +531,11 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
 
     install_signal_handlers();
 
-    eprintln!("Probing entropy sources...");
+    if !quiet {
+        eprintln!("Probing entropy sources...");
+    }
     let all_sources = entropy::build_check_sources(cpu_config);
-    let sources = probe_sources(all_sources);
+    let sources = probe_sources(all_sources, quiet);
 
     // Filter by user-requested sources
     let sources: Vec<Box<dyn EntropySource>> = if let Some(ref names) = args.sources {
@@ -538,14 +551,16 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
         return Err(Error::NoEntropy("no entropy sources available".into()));
     }
 
-    let source_list: Vec<&str> = sources.iter().map(|s| s.name()).collect();
-    eprintln!(
-        "\nStatistical check: sources=[{}], duration={}, sample_size={} bytes",
-        source_list.join(", "),
-        format_duration(duration),
-        args.sample_size
-    );
-    eprintln!();
+    if !quiet {
+        let source_list: Vec<&str> = sources.iter().map(|s| s.name()).collect();
+        eprintln!(
+            "\nStatistical check: sources=[{}], duration={}, sample_size={} bytes",
+            source_list.join(", "),
+            format_duration(duration),
+            args.sample_size
+        );
+        eprintln!();
+    }
 
     let mut stats_vec: Vec<SourceStats> = sources.iter().map(|_| SourceStats::new()).collect();
 
@@ -570,7 +585,11 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
                     stat.total_time += elapsed;
 
                     if do_fips {
-                        let fips_data: &[u8; 2500] = (&data[..2500]).try_into().unwrap();
+                        if data.len() < 2500 {
+                            stats_vec[i].errors += 1;
+                            continue;
+                        }
+                        let fips_data: &[u8; 2500] = (&data[..2500]).try_into().expect("checked length above");
                         let fips = stats::fips_suite(fips_data);
                         if fips.monobit.passed {
                             stat.fips_monobit_pass += 1;
@@ -606,7 +625,7 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
                 }
             }
 
-            if last_report.elapsed().as_secs() >= args.report_interval {
+            if !quiet && last_report.elapsed().as_secs() >= args.report_interval {
                 print_progress(&sources, &stats_vec, start.elapsed(), duration, do_fips);
                 last_report = Instant::now();
             }
@@ -615,13 +634,15 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
 
     let total_elapsed = start.elapsed();
 
-    if SHUTDOWN.load(Ordering::Acquire) {
-        eprintln!(
-            "\nInterrupted after {} — printing partial results\n",
-            format_duration(total_elapsed)
-        );
-    } else {
-        eprintln!("\nCompleted {} check\n", format_duration(total_elapsed));
+    if !quiet {
+        if SHUTDOWN.load(Ordering::Acquire) {
+            eprintln!(
+                "\nInterrupted after {} — printing partial results\n",
+                format_duration(total_elapsed)
+            );
+        } else {
+            eprintln!("\nCompleted {} check\n", format_duration(total_elapsed));
+        }
     }
 
     match args.output_format {

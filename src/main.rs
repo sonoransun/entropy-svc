@@ -96,9 +96,11 @@ fn run_generate(cli: &Cli, cpu_config: &CpuRngConfig) {
         match entropy::generate(cli.bytes, cpu_config) {
             Ok(result) => {
                 log::info!("entropy source: {}", result.source);
-                if let Err(e) =
-                    output::write_output(&result.bytes, &cli.format, cli.output_file.as_deref())
-                {
+                let mut bytes = result.bytes;
+                let write_result =
+                    output::write_output(&bytes, &cli.format, cli.output_file.as_deref());
+                entropy::cpurng::zeroize_vec(&mut bytes);
+                if let Err(e) = write_result {
                     log::error!("error writing output: {}", e);
                     process::exit(1);
                 }
@@ -112,18 +114,20 @@ fn run_generate(cli: &Cli, cpu_config: &CpuRngConfig) {
 }
 
 fn run_list_sources(cpu_config: &CpuRngConfig) {
+    const PROBE_BYTES: usize = 32;
     let sources = entropy::build_check_sources(cpu_config);
-    println!("{:<12} {:<10} Description", "Name", "Status");
-    println!("{:-<12} {:-<10} {:-<50}", "", "", "");
+    println!("{:<12} {:<10} {:<10} Description", "Name", "Status", "Type");
+    println!("{:-<12} {:-<10} {:-<10} {:-<50}", "", "", "", "");
     for source in &sources {
-        let (status, detail) = match source.collect(32) {
+        let (status, detail) = match source.collect(PROBE_BYTES) {
             Ok(_) => ("available", String::new()),
             Err(e) => ("skip", format!(" ({})", e)),
         };
         println!(
-            "{:<12} {:<10} {}{}",
+            "{:<12} {:<10} {:<10} {}{}",
             source.name(),
             status,
+            source.source_type(),
             source.description(),
             detail
         );

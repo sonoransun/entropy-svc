@@ -1,23 +1,47 @@
+use crate::cli::DaemonArgs;
+#[cfg(target_os = "linux")]
+use crate::config;
+use crate::config::CpuRngConfig;
+use crate::error::Error;
+
+#[cfg(not(target_os = "linux"))]
+pub fn run(_args: &DaemonArgs, _cpu_config: &CpuRngConfig) -> Result<(), Error> {
+    Err(Error::InvalidArgs(
+        "daemon mode is only supported on Linux".into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::thread;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
-use crate::cli::DaemonArgs;
-use crate::config::CpuRngConfig;
+#[cfg(target_os = "linux")]
 use crate::entropy;
+#[cfg(target_os = "linux")]
 use crate::entropy::cpurng::zeroize_vec;
-use crate::error::Error;
+#[cfg(target_os = "linux")]
+use crate::health::HealthTester;
+#[cfg(target_os = "linux")]
 use crate::memlock;
 
-/// ioctl number for RNDADDENTROPY: _IOW('R', 0x03, int[2])
+#[cfg(target_os = "linux")]
 const RNDADDENTROPY: libc::c_ulong = 0x40085203;
 
+#[cfg(target_os = "linux")]
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
 static RELOAD: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
 /// Build the `rand_pool_info` struct as a raw byte buffer:
 /// ```text
 /// struct rand_pool_info {
@@ -38,6 +62,7 @@ fn build_rand_pool_info(data: &[u8], entropy_bits: u32) -> Vec<u8> {
     buf
 }
 
+#[cfg(target_os = "linux")]
 /// Inject entropy into the kernel pool via ioctl(RNDADDENTROPY).
 /// The ioctl buffer is zeroized after use regardless of success or failure.
 fn inject_entropy(dev_random: &File, data: &[u8], entropy_bits: u32) -> Result<(), Error> {
@@ -52,6 +77,7 @@ fn inject_entropy(dev_random: &File, data: &[u8], entropy_bits: u32) -> Result<(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 /// Read the current kernel entropy estimate from procfs.
 fn read_entropy_avail() -> Result<u32, Error> {
     let s = fs::read_to_string("/proc/sys/kernel/random/entropy_avail")?;
@@ -60,6 +86,7 @@ fn read_entropy_avail() -> Result<u32, Error> {
         .map_err(|e| Error::NoEntropy(format!("failed to parse entropy_avail: {}", e)))
 }
 
+#[cfg(target_os = "linux")]
 /// Validate that we can open /dev/random for writing (requires root).
 fn validate_permissions() -> Result<File, Error> {
     OpenOptions::new()
@@ -79,7 +106,7 @@ fn validate_permissions() -> Result<File, Error> {
 /// Drop privileges to the specified user.
 /// Calls getpwnam -> setgroups(0) -> setgid -> setuid.
 /// Must be called while still root.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn drop_privileges(username: &str) -> Result<(), Error> {
     use std::ffi::CString;
 
@@ -126,8 +153,7 @@ fn drop_privileges(username: &str) -> Result<(), Error> {
     Ok(())
 }
 
-// --- PID file management ---
-
+#[cfg(target_os = "linux")]
 /// Write a PID file. Checks if an existing PID is alive via kill(pid, 0).
 fn write_pid_file(path: &Path) -> Result<(), Error> {
     // Check if another instance is running
@@ -156,12 +182,12 @@ fn write_pid_file(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn remove_pid_file(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-// --- systemd sd_notify ---
-
+#[cfg(target_os = "linux")]
 /// Send a systemd notification if $NOTIFY_SOCKET is set.
 fn sd_notify(state: &str) {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
@@ -172,20 +198,21 @@ fn sd_notify(state: &str) {
     }
 }
 
-// --- Signal handlers ---
-
+#[cfg(target_os = "linux")]
 extern "C" fn shutdown_handler(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
+#[cfg(target_os = "linux")]
 extern "C" fn reload_handler(_sig: libc::c_int) {
     RELOAD.store(true, Ordering::Release);
 }
 
+#[cfg(target_os = "linux")]
 fn install_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = shutdown_handler as *const () as usize;
+        sa.sa_sigaction = shutdown_handler as libc::sighandler_t;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
@@ -193,13 +220,14 @@ fn install_signal_handlers() {
 
         // SIGHUP triggers config reload
         let mut sa_hup: libc::sigaction = std::mem::zeroed();
-        sa_hup.sa_sigaction = reload_handler as *const () as usize;
+        sa_hup.sa_sigaction = reload_handler as libc::sighandler_t;
         sa_hup.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa_hup.sa_mask);
         libc::sigaction(libc::SIGHUP, &sa_hup, std::ptr::null_mut());
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Interruptible sleep: sleeps in 250ms steps, checking SHUTDOWN between each.
 fn interruptible_sleep(total: Duration) {
     let step = Duration::from_millis(250);
@@ -211,6 +239,7 @@ fn interruptible_sleep(total: Duration) {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Compute adaptive sleep duration based on current entropy level.
 /// Critical low (< threshold/2) -> 100ms, low (< threshold) -> 1s, normal -> configured interval.
 fn adaptive_sleep(avail: u32, threshold: u32, normal_interval: u64) -> Duration {
@@ -223,12 +252,53 @@ fn adaptive_sleep(avail: u32, threshold: u32, normal_interval: u64) -> Duration 
     }
 }
 
+#[cfg(target_os = "linux")]
+fn health_check_bytes(data: &[u8], health: &mut HealthTester) -> bool {
+    for chunk in data.chunks_exact(8) {
+        let sample = u64::from_ne_bytes(chunk.try_into().unwrap());
+        if health.feed(sample).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn reload_config(config_path: Option<&Path>, cpu_config: &mut CpuRngConfig) {
+    match config::load_config(config_path) {
+        Ok(c) => {
+            let mut new_cfg = c.cpu_rng;
+            config::apply_env_overrides(&mut new_cfg);
+            let warnings = new_cfg.validate();
+            for w in warnings {
+                log::warn!(target: "mixrand::daemon", "config: {}", w);
+            }
+            *cpu_config = new_cfg;
+            log::info!(target: "mixrand::daemon", "config reloaded successfully");
+        }
+        Err(e) => {
+            log::error!(target: "mixrand::daemon", "config reload failed: {}", e);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     if args.batch_size == 0 {
         return Err(Error::InvalidArgs("batch-size must be greater than 0".into()));
     }
 
     let dev_random = validate_permissions()?;
+
+    // Lock all process memory to prevent swapping entropy data to disk
+    let ret = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+    if ret != 0 {
+        log::warn!(
+            target: "mixrand::daemon",
+            "mlockall failed: {} (consider CAP_IPC_LOCK)",
+            std::io::Error::last_os_error()
+        );
+    }
 
     install_signal_handlers();
 
@@ -239,10 +309,12 @@ pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     }
 
     // Drop privileges after opening /dev/random and installing signal handlers
-    #[cfg(unix)]
     if let Some(ref user) = args.user {
         drop_privileges(user)?;
     }
+
+    let config_path: Option<PathBuf> = args.config_file.clone();
+    let mut cpu_config = cpu_config.clone();
 
     log::info!(
         target: "mixrand::daemon",
@@ -256,26 +328,41 @@ pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     let start = Instant::now();
     let mut total_injections: u64 = 0;
     let mut total_bytes_injected: u64 = 0;
+    let mut health_skips: u64 = 0;
     let mut last_heartbeat = Instant::now();
     let heartbeat_interval = Duration::from_secs(300); // 5 minutes
     let mut last_sleep;
+    let mut health = HealthTester::new(4.0);
 
     while !SHUTDOWN.load(Ordering::Acquire) {
         // Check for config reload signal
         if RELOAD.swap(false, Ordering::Acquire) {
-            log::info!(target: "mixrand::daemon", "SIGHUP received, config reload requested");
-            // Config reload would go here if we had a mutable config reference
-            // For now, just log it
+            log::info!(target: "mixrand::daemon", "SIGHUP received, reloading config");
+            reload_config(config_path.as_deref(), &mut cpu_config);
         }
 
         match read_entropy_avail() {
             Ok(avail) => {
                 if avail < args.threshold {
-                    // Use best-available source (not just fallback)
-                    match entropy::generate(args.batch_size, cpu_config) {
+                    match entropy::generate(args.batch_size, &cpu_config) {
                         Ok(result) => {
                             let mut data = result.bytes;
                             memlock::lock_and_protect(&data);
+
+                            // Health check before injection
+                            if !health_check_bytes(&data, &mut health) {
+                                log::warn!(
+                                    target: "mixrand::daemon",
+                                    "health check failed for {} output, skipping injection",
+                                    result.source,
+                                );
+                                health_skips += 1;
+                                memlock::munlock_slice(&data);
+                                zeroize_vec(&mut data);
+                                last_sleep = Duration::from_secs(1);
+                                continue;
+                            }
+
                             let credit_bits = args.batch_size as u32 * args.credit_ratio;
                             match inject_entropy(&dev_random, &data, credit_bits) {
                                 Ok(()) => {
@@ -330,8 +417,9 @@ pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
             let uptime = start.elapsed();
             log::info!(
                 target: "mixrand::daemon",
-                "heartbeat: uptime={}s injections={} total_bytes={}",
+                "heartbeat: uptime={}s injections={} total_bytes={} health_skips={} rct_failures={} apt_failures={}",
                 uptime.as_secs(), total_injections, total_bytes_injected,
+                health_skips, health.rct_failures(), health.apt_failures(),
             );
             last_heartbeat = Instant::now();
         }
@@ -344,8 +432,8 @@ pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
 
     log::info!(
         target: "mixrand::daemon",
-        "shutting down (injections={}, bytes={})",
-        total_injections, total_bytes_injected,
+        "shutting down (injections={}, bytes={}, health_skips={})",
+        total_injections, total_bytes_injected, health_skips,
     );
 
     // Clean up PID file
@@ -358,11 +446,9 @@ pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-
-    // --- build_rand_pool_info ---
 
     #[test]
     fn test_build_rand_pool_info_basic() {

@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::config::CpuRngConfig;
 use crate::error::Error;
+use crate::health::HealthTester;
 
 /// Result of entropy generation, including the bytes and which source was used.
 pub struct EntropyResult {
@@ -32,6 +33,11 @@ pub trait EntropySource: Send + Sync {
     /// Quick availability check. Returns true if the source is likely to work.
     fn is_available(&self) -> bool;
 
+    /// Source classification: "hardware", "system", or "software".
+    fn source_type(&self) -> &str {
+        "software"
+    }
+
     /// Collect `count` bytes of entropy.
     fn collect(&self, count: usize) -> Result<Vec<u8>, Error>;
 }
@@ -51,6 +57,9 @@ impl EntropySource for HwrngSource {
     }
     fn priority(&self) -> u32 {
         10
+    }
+    fn source_type(&self) -> &str {
+        "hardware"
     }
     fn is_available(&self) -> bool {
         Path::new("/dev/hwrng").exists()
@@ -84,6 +93,9 @@ impl EntropySource for CpuRngStandaloneSource {
     fn priority(&self) -> u32 {
         20
     }
+    fn source_type(&self) -> &str {
+        "hardware"
+    }
     fn is_available(&self) -> bool {
         cpurng::collect_cpu_entropy(1, &self.config).is_ok()
     }
@@ -115,6 +127,9 @@ impl EntropySource for RdseedSource {
     fn priority(&self) -> u32 {
         21
     }
+    fn source_type(&self) -> &str {
+        "hardware"
+    }
     fn is_available(&self) -> bool {
         cpurng::collect_rdseed(1, self.retries).is_ok()
     }
@@ -144,6 +159,9 @@ impl EntropySource for RdrandSource {
     }
     fn priority(&self) -> u32 {
         22
+    }
+    fn source_type(&self) -> &str {
+        "hardware"
     }
     fn is_available(&self) -> bool {
         cpurng::collect_rdrand(1, self.retries).is_ok()
@@ -175,6 +193,9 @@ impl EntropySource for XstoreSource {
     fn priority(&self) -> u32 {
         23
     }
+    fn source_type(&self) -> &str {
+        "hardware"
+    }
     fn is_available(&self) -> bool {
         cpurng::collect_xstore(1, self.quality).is_ok()
     }
@@ -204,6 +225,9 @@ impl EntropySource for RndrSource {
     }
     fn priority(&self) -> u32 {
         24
+    }
+    fn source_type(&self) -> &str {
+        "hardware"
     }
     fn is_available(&self) -> bool {
         cpurng::collect_rndr(1, self.retries).is_ok()
@@ -235,6 +259,9 @@ impl EntropySource for RndrrsSource {
     fn priority(&self) -> u32 {
         25
     }
+    fn source_type(&self) -> &str {
+        "hardware"
+    }
     fn is_available(&self) -> bool {
         cpurng::collect_rndrrs(1, self.retries).is_ok()
     }
@@ -254,6 +281,9 @@ impl EntropySource for HavegedSource {
     }
     fn priority(&self) -> u32 {
         30
+    }
+    fn source_type(&self) -> &str {
+        "system"
     }
     fn is_available(&self) -> bool {
         haveged::read_haveged(1).is_ok()
@@ -275,6 +305,9 @@ impl EntropySource for GetrandomSource {
     fn priority(&self) -> u32 {
         35
     }
+    fn source_type(&self) -> &str {
+        "system"
+    }
     fn is_available(&self) -> bool {
         getrandom::read_getrandom(1).is_ok()
     }
@@ -294,6 +327,9 @@ impl EntropySource for UrandomSource {
     }
     fn priority(&self) -> u32 {
         36
+    }
+    fn source_type(&self) -> &str {
+        "system"
     }
     fn is_available(&self) -> bool {
         Path::new("/dev/urandom").exists()
@@ -369,18 +405,36 @@ pub fn build_check_sources(config: &CpuRngConfig) -> Vec<Box<dyn EntropySource>>
     ]
 }
 
-/// Attempts entropy sources in priority order:
-/// 1. Hardware RNG (/dev/hwrng)
-/// 2. CPU hardware RNG (RDSEED/RDRAND/XSTORE/RNDR/RNDRRS) with standalone oversampling
-/// 3. Haveged (/dev/random with haveged)
-/// 4. Fallback (getrandom/urandom + procfs + jitter + cpu-rng -> BLAKE2b -> ChaCha20)
+/// Run a quick health check on entropy bytes using NIST SP 800-90B tests.
+/// Returns `true` if the bytes pass, `false` if a health failure is detected.
+fn health_check(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return true; // too few bytes for meaningful health check
+    }
+    let mut ht = HealthTester::new(4.0);
+    for chunk in bytes.chunks_exact(8) {
+        let sample = u64::from_ne_bytes(chunk.try_into().unwrap());
+        if ht.feed(sample).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Attempts entropy sources in priority order, running a health check on each.
+/// Sources that fail collection or health testing are skipped.
 pub fn generate(count: usize, config: &CpuRngConfig) -> Result<EntropyResult, Error> {
     let sources = build_generate_sources(config);
 
-    let mut last_err = None;
+    let mut tried = Vec::new();
     for source in &sources {
         match source.collect(count) {
             Ok(bytes) => {
+                if !health_check(&bytes) {
+                    log::warn!("{} failed health check, trying next source", source.name());
+                    tried.push(format!("{}: health check failed", source.name()));
+                    continue;
+                }
                 return Ok(EntropyResult {
                     bytes,
                     source: source.description().into(),
@@ -388,12 +442,19 @@ pub fn generate(count: usize, config: &CpuRngConfig) -> Result<EntropyResult, Er
             }
             Err(e) => {
                 log::debug!("{} unavailable: {}", source.name(), e);
-                last_err = Some(e);
+                tried.push(format!("{}: {}", source.name(), e));
             }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| Error::NoEntropy("no entropy sources available".into())))
+    if tried.is_empty() {
+        Err(Error::NoEntropy("no entropy sources configured".into()))
+    } else {
+        Err(Error::NoEntropy(format!(
+            "all entropy sources failed: {}",
+            tried.join("; ")
+        )))
+    }
 }
 
 #[cfg(test)]

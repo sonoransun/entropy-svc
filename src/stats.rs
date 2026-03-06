@@ -232,7 +232,7 @@ pub fn min_entropy(data: &[u8]) -> f64 {
     }
     let freq = byte_frequencies(data);
     let n = data.len() as f64;
-    let max_count = *freq.iter().max().unwrap() as f64;
+    let max_count = *freq.iter().max().unwrap_or(&0) as f64;
     -(max_count / n).log2()
 }
 

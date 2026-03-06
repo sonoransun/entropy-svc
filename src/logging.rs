@@ -203,6 +203,7 @@ pub fn init(args: &LogArgs, is_daemon: bool) {
             .map(Mutex::new)
     });
 
+    #[cfg(unix)]
     let syslog = if args.syslog {
         syslog::unix(syslog::Formatter3164 {
             facility: syslog::Facility::LOG_DAEMON,
@@ -213,6 +214,13 @@ pub fn init(args: &LogArgs, is_daemon: bool) {
         .ok()
         .map(Mutex::new)
     } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let syslog: Option<Mutex<SyslogLogger>> = {
+        if args.syslog {
+            log::warn!("syslog is not supported on this platform");
+        }
         None
     };
 
