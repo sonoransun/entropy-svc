@@ -1,3 +1,9 @@
+/// Default assumed min-entropy per 64-bit sample (in bits).
+/// H=4.0 gives RCT cutoff of 11 and conservative APT thresholds.
+/// This is a deliberate underestimate for defense-in-depth:
+/// true hardware RNG entropy should be higher.
+pub const DEFAULT_MIN_ENTROPY_BITS: f64 = 4.0;
+
 /// Continuous health testing per NIST SP 800-90B.
 ///
 /// Two tests run on every entropy sample:
@@ -188,5 +194,84 @@ mod tests {
         let ht = HealthTester::new(0.5);
         // H=0.5: RCT cutoff = 1 + ceil(40/0.5) = 81
         assert_eq!(ht.rct_cutoff, 81);
+    }
+
+    #[test]
+    fn test_has_failures_initially_false() {
+        let ht = HealthTester::new(4.0);
+        assert!(!ht.has_failures());
+        assert_eq!(ht.rct_failures(), 0);
+        assert_eq!(ht.apt_failures(), 0);
+        assert_eq!(ht.total_samples(), 0);
+    }
+
+    #[test]
+    fn test_rct_cutoff_zero_entropy() {
+        // H=0.0 clamps to cutoff 42
+        let mut ht = HealthTester::new(0.0);
+        for _ in 0..41 {
+            assert!(ht.feed(0).is_ok());
+        }
+        // 42nd identical value should fail
+        assert!(ht.feed(0).is_err());
+    }
+
+    #[test]
+    fn test_rct_cutoff_negative_entropy() {
+        // H=-1.0 also clamps to cutoff 42
+        let mut ht = HealthTester::new(-1.0);
+        for _ in 0..41 {
+            assert!(ht.feed(0).is_ok());
+        }
+        // 42nd identical value should fail
+        assert!(ht.feed(0).is_err());
+    }
+
+    #[test]
+    fn test_multiple_rct_failures_increment() {
+        // H=4.0: cutoff = 1 + ceil(40/4) = 11
+        let mut ht = HealthTester::new(4.0);
+        // Feed 10 identical values — all pass (count goes 1..10, below cutoff 11)
+        for _ in 0..10 {
+            assert!(ht.feed(0).is_ok());
+        }
+        // 11th triggers first failure
+        assert!(ht.feed(0).is_err());
+        // 12th through 16th: each still identical, count stays >= cutoff, all fail
+        for _ in 0..5 {
+            assert!(ht.feed(0).is_err());
+        }
+        assert_eq!(ht.rct_failures(), 6);
+    }
+
+    #[test]
+    fn test_apt_window_boundary() {
+        let mut ht = HealthTester::new(4.0);
+        // Feed 1024 unique values — should not trigger APT
+        for i in 0..1024u64 {
+            assert!(ht.feed(i).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_total_samples_counter() {
+        let mut ht = HealthTester::new(4.0);
+        for i in 0..100u64 {
+            let _ = ht.feed(i);
+        }
+        assert_eq!(ht.total_samples(), 100);
+    }
+
+    #[test]
+    fn test_apt_reset_after_complete_window() {
+        let mut ht = HealthTester::new(4.0);
+        // First window: 1024 diverse samples
+        for i in 0..1024u64 {
+            assert!(ht.feed(i).is_ok());
+        }
+        // Second window: another 1024 diverse samples (offset to stay unique)
+        for i in 1024..2048u64 {
+            assert!(ht.feed(i).is_ok());
+        }
     }
 }

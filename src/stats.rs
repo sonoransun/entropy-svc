@@ -761,4 +761,81 @@ mod tests {
         assert!(est.compression_ratio > 0.0);
         assert!(est.block_entropy_2 > 0.0);
     }
+
+    // --- Edge cases and boundary conditions ---
+
+    #[test]
+    fn test_approximate_entropy_short_data() {
+        // 1 byte = 8 bits, m=10 means we need > 10+1=11 bits, so should return 0.0
+        assert_eq!(approximate_entropy(&[0xFF], 10), 0.0);
+    }
+
+    #[test]
+    fn test_lempel_ziv_single_byte() {
+        // data.len() < 2 should return 0.0
+        assert_eq!(lempel_ziv_complexity(&[42]), 0.0);
+    }
+
+    #[test]
+    fn test_lempel_ziv_two_identical() {
+        let lz = lempel_ziv_complexity(&[42, 42]);
+        assert!(lz > 0.0, "expected > 0.0 for two-byte input, got {}", lz);
+    }
+
+    #[test]
+    fn test_block_entropy_block_exceeds_data() {
+        assert_eq!(block_entropy(&[1, 2, 3], 4), 0.0);
+    }
+
+    #[test]
+    fn test_block_entropy_zero_block_size() {
+        assert_eq!(block_entropy(&[1, 2, 3], 0), 0.0);
+    }
+
+    #[test]
+    fn test_block_entropy_exact_one_block() {
+        // Single block means one symbol with p=1.0, so entropy = 0.0
+        assert_eq!(block_entropy(&[1, 2], 2), 0.0);
+    }
+
+    #[test]
+    fn test_autocorrelation_lag_equals_len() {
+        assert_eq!(autocorrelation(&[1, 2, 3], 3), 0.0);
+    }
+
+    #[test]
+    fn test_autocorrelation_lag_exceeds_len() {
+        assert_eq!(autocorrelation(&[1, 2], 5), 0.0);
+    }
+
+    #[test]
+    fn test_chi_square_p_value_edges() {
+        let p_low_chi = chi_square_p_value(0.0, 255.0);
+        assert!(
+            (p_low_chi - 1.0).abs() < 0.01,
+            "expected p-value ~1.0 for chi_sq=0.0, got {}",
+            p_low_chi
+        );
+        let p_high_chi = chi_square_p_value(1000.0, 255.0);
+        assert!(
+            p_high_chi < 0.01,
+            "expected p-value ~0.0 for chi_sq=1000.0, got {}",
+            p_high_chi
+        );
+    }
+
+    #[test]
+    fn test_shannon_entropy_empty() {
+        assert_eq!(shannon_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_min_entropy_empty() {
+        assert_eq!(min_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_mean_byte_empty() {
+        assert_eq!(mean_byte(&[]), 0.0);
+    }
 }

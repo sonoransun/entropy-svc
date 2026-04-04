@@ -155,6 +155,10 @@ fn drop_privileges(username: &str) -> Result<(), Error> {
 
 #[cfg(target_os = "linux")]
 /// Write a PID file. Checks if an existing PID is alive via kill(pid, 0).
+///
+/// Note: This has an inherent TOCTOU race between checking the existing PID
+/// and writing the new one. This is standard for PID file implementations
+/// and is acceptable for daemon management (not security-critical).
 fn write_pid_file(path: &Path) -> Result<(), Error> {
     // Check if another instance is running
     if path.exists() {
@@ -332,7 +336,7 @@ pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     let mut last_heartbeat = Instant::now();
     let heartbeat_interval = Duration::from_secs(300); // 5 minutes
     let mut last_sleep;
-    let mut health = HealthTester::new(4.0);
+    let mut health = HealthTester::new(crate::health::DEFAULT_MIN_ENTROPY_BITS);
 
     while !SHUTDOWN.load(Ordering::Acquire) {
         // Check for config reload signal
@@ -523,5 +527,36 @@ mod tests {
         assert_eq!(adaptive_sleep(128, 256, 5), Duration::from_secs(1));
         // avail == threshold -> normal
         assert_eq!(adaptive_sleep(256, 256, 5), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_build_rand_pool_info_single_byte() {
+        let buf = build_rand_pool_info(&[0x42], 8);
+        // 1 byte padded to 4: total = 4 + 4 + 4 = 12
+        assert_eq!(buf.len(), 12);
+        let buf_size = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        assert_eq!(buf_size, 1);
+        assert_eq!(buf[8], 0x42);
+        // Padding bytes should be zero
+        assert_eq!(buf[9], 0);
+        assert_eq!(buf[10], 0);
+        assert_eq!(buf[11], 0);
+    }
+
+    #[test]
+    fn test_build_rand_pool_info_three_bytes() {
+        let buf = build_rand_pool_info(&[1, 2, 3], 24);
+        // 3 bytes padded to 4: total = 4 + 4 + 4 = 12
+        assert_eq!(buf.len(), 12);
+        assert_eq!(buf[8], 1);
+        assert_eq!(buf[9], 2);
+        assert_eq!(buf[10], 3);
+        assert_eq!(buf[11], 0); // padding
+    }
+
+    #[test]
+    fn test_adaptive_sleep_zero_threshold() {
+        // threshold=0, threshold/2=0. avail(0) < 0 is false, so normal interval
+        assert_eq!(adaptive_sleep(0, 0, 5), Duration::from_secs(5));
     }
 }

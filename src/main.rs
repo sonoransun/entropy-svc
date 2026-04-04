@@ -84,13 +84,30 @@ fn build_cpu_rng_config(config_file: Option<&Path>, cpu_rng_args: &CpuRngArgs) -
     cfg
 }
 
+/// Maximum byte count per generation (100 MiB).
+const MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// Maximum iteration count for --count flag.
+const MAX_COUNT: usize = 10_000;
+
 fn run_generate(cli: &Cli, cpu_config: &CpuRngConfig) {
     if cli.bytes == 0 {
         log::error!("byte count must be greater than 0");
         process::exit(1);
     }
+    if cli.bytes > MAX_BYTES {
+        log::error!(
+            "byte count {} exceeds maximum {} (100 MiB)",
+            cli.bytes, MAX_BYTES
+        );
+        process::exit(1);
+    }
 
     let iterations = cli.count.unwrap_or(1).max(1);
+    if iterations > MAX_COUNT {
+        log::error!("--count {} exceeds maximum {}", iterations, MAX_COUNT);
+        process::exit(1);
+    }
 
     for _ in 0..iterations {
         match entropy::generate(cli.bytes, cpu_config) {
@@ -193,5 +210,102 @@ fn main() {
 
             run_generate(&cli, &cpu_config);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_log_args() -> logging::LogArgs {
+        logging::LogArgs {
+            log_level: None,
+            log_file: None,
+            syslog: false,
+            log_format: logging::LogFormat::Text,
+        }
+    }
+
+    fn default_cpu_rng_args() -> CpuRngArgs {
+        CpuRngArgs {
+            enable_rdseed: None,
+            enable_rdrand: None,
+            enable_xstore: None,
+            enable_rndr: None,
+            enable_rndrrs: None,
+            rdrand_retries: None,
+            rdseed_retries: None,
+            rndr_retries: None,
+            rndrrs_retries: None,
+            xstore_quality: None,
+            cpu_rng_prefer: None,
+            fallback_mix_bytes: None,
+            oversample: None,
+            mixer_mode: None,
+        }
+    }
+
+    #[test]
+    fn test_effective_log_level_verbose() {
+        let args = default_log_args();
+        assert!(matches!(
+            effective_log_level(&args, true, false),
+            Some(logging::LogLevel::Debug)
+        ));
+    }
+
+    #[test]
+    fn test_effective_log_level_quiet() {
+        let args = default_log_args();
+        assert!(matches!(
+            effective_log_level(&args, false, true),
+            Some(logging::LogLevel::Error)
+        ));
+    }
+
+    #[test]
+    fn test_effective_log_level_explicit() {
+        let mut args = default_log_args();
+        args.log_level = Some(logging::LogLevel::Info);
+        assert!(matches!(
+            effective_log_level(&args, false, false),
+            Some(logging::LogLevel::Info)
+        ));
+    }
+
+    #[test]
+    fn test_effective_log_level_none() {
+        let args = default_log_args();
+        assert!(effective_log_level(&args, false, false).is_none());
+    }
+
+    #[test]
+    fn test_build_cpu_rng_config_defaults_no_file() {
+        let args = default_cpu_rng_args();
+        let cfg = build_cpu_rng_config(None, &args);
+        let default = CpuRngConfig::default();
+        assert_eq!(cfg.enable_rdseed, default.enable_rdseed);
+        assert_eq!(cfg.rdrand_retries, default.rdrand_retries);
+        assert_eq!(cfg.oversample, default.oversample);
+    }
+
+    #[test]
+    fn test_build_cpu_rng_config_cli_overrides() {
+        let mut args = default_cpu_rng_args();
+        args.enable_rdseed = Some(false);
+        args.rdrand_retries = Some(50);
+        let cfg = build_cpu_rng_config(None, &args);
+        assert!(!cfg.enable_rdseed);
+        assert_eq!(cfg.rdrand_retries, 50);
+        // Unset fields remain default
+        assert!(cfg.enable_rdrand);
+    }
+
+    #[test]
+    fn test_build_cpu_rng_config_validates() {
+        let mut args = default_cpu_rng_args();
+        args.rdrand_retries = Some(200);
+        let cfg = build_cpu_rng_config(None, &args);
+        assert_eq!(cfg.rdrand_retries, 100); // clamped from 200
     }
 }

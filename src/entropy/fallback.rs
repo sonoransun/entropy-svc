@@ -170,4 +170,26 @@ mod tests {
         let result = generate_fallback(0, &config).unwrap();
         assert!(result.is_empty());
     }
+
+    #[test]
+    fn test_generate_fallback_large_request() {
+        let config = CpuRngConfig::default();
+        let size = crate::csprng::RESEED_INTERVAL + 1;
+        let result = generate_fallback(size, &config).unwrap();
+        assert_eq!(result.len(), size);
+    }
+
+    #[test]
+    fn test_generate_fallback_both_mixer_modes() {
+        let blake_config = CpuRngConfig::default();
+        let blake_result = generate_fallback(64, &blake_config).unwrap();
+        assert_eq!(blake_result.len(), 64);
+
+        let hkdf_config = CpuRngConfig {
+            mixer_mode: MixerMode::Hkdf,
+            ..Default::default()
+        };
+        let hkdf_result = generate_fallback(64, &hkdf_config).unwrap();
+        assert_eq!(hkdf_result.len(), 64);
+    }
 }

@@ -516,7 +516,20 @@ fn output_csv(
     }
 }
 
+/// Maximum sample size for statistical tests (10 MiB).
+const MAX_SAMPLE_SIZE: usize = 10 * 1024 * 1024;
+
 pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
+    if args.sample_size == 0 {
+        return Err(Error::InvalidArgs("sample-size must be greater than 0".into()));
+    }
+    if args.sample_size > MAX_SAMPLE_SIZE {
+        return Err(Error::InvalidArgs(format!(
+            "sample-size {} exceeds maximum {} (10 MiB)",
+            args.sample_size, MAX_SAMPLE_SIZE
+        )));
+    }
+
     let duration = parse_duration(&args.duration)?;
     let do_fips = args.sample_size >= 2500;
 
@@ -589,7 +602,13 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
                             stats_vec[i].errors += 1;
                             continue;
                         }
-                        let fips_data: &[u8; 2500] = (&data[..2500]).try_into().expect("checked length above");
+                        let fips_data: &[u8; 2500] = match (&data[..2500]).try_into() {
+                            Ok(arr) => arr,
+                            Err(_) => {
+                                stats_vec[i].errors += 1;
+                                continue;
+                            }
+                        };
                         let fips = stats::fips_suite(fips_data);
                         if fips.monobit.passed {
                             stat.fips_monobit_pass += 1;
@@ -790,5 +809,34 @@ mod tests {
         assert!((stat.throughput_bytes_per_sec() - 5000.0).abs() < f64::EPSILON);
         assert!((stat.avg(stat.approx_entropy_m2_sum) - 0.693).abs() < 0.001);
         assert!((stat.avg(stat.compression_ratio_sum) - 0.95).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_duration_whitespace() {
+        assert_eq!(parse_duration("  30s  ").unwrap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_parse_duration_large_value() {
+        assert_eq!(parse_duration("365d").unwrap(), Duration::from_secs(365 * 86400));
+    }
+
+    #[test]
+    fn test_format_throughput_zero() {
+        let result = format_throughput(0.0);
+        assert!(result.contains("0"), "expected '0' in '{}'", result);
+    }
+
+    #[test]
+    fn test_format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn test_source_stats_new_all_zero() {
+        let stat = SourceStats::new();
+        assert_eq!(stat.total_samples, 0);
+        assert_eq!(stat.total_bytes, 0);
+        assert_eq!(stat.errors, 0);
     }
 }

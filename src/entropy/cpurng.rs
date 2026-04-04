@@ -745,4 +745,60 @@ mod tests {
             assert!(buf.iter().any(|&b| b != 0));
         }
     }
+
+    #[test]
+    fn test_instruction_order_prefer_rdrand() {
+        let config = CpuRngConfig {
+            prefer: CpuRngPreference::Rdrand,
+            ..Default::default()
+        };
+        let order = instruction_order(&config);
+        assert_eq!(order[0], CpuRngPreference::Rdrand);
+    }
+
+    #[test]
+    fn test_instruction_order_prefer_rndrrs() {
+        let config = CpuRngConfig {
+            prefer: CpuRngPreference::Rndrrs,
+            ..Default::default()
+        };
+        let order = instruction_order(&config);
+        assert_eq!(order[0], CpuRngPreference::Rndrrs);
+    }
+
+    #[test]
+    fn test_instruction_order_all_disabled() {
+        let config = CpuRngConfig {
+            enable_rdseed: false,
+            enable_rdrand: false,
+            enable_xstore: false,
+            enable_rndr: false,
+            enable_rndrrs: false,
+            ..Default::default()
+        };
+        let order = instruction_order(&config);
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn test_instruction_order_single_enabled() {
+        let config = CpuRngConfig {
+            enable_rdseed: false,
+            enable_rdrand: false,
+            enable_xstore: false,
+            enable_rndr: true,
+            enable_rndrrs: false,
+            ..Default::default()
+        };
+        let order = instruction_order(&config);
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0], CpuRngPreference::Rndr);
+    }
+
+    #[test]
+    fn test_zeroize_large_buffer() {
+        let mut buf = vec![0xFF; 1024 * 1024];
+        zeroize_bytes(&mut buf);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
 }

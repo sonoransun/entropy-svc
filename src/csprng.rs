@@ -132,4 +132,43 @@ mod tests {
         assert_eq!(out.len(), 64);
         assert_eq!(counter, 0); // No reseed needed for small request
     }
+
+    #[test]
+    fn test_generate_zero_bytes() {
+        let out = generate([0u8; 32], 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_generate_reseeding_exact_boundary() {
+        let seed = [42u8; 32];
+        let mut counter = 0u8;
+        let out = generate_reseeding(seed, RESEED_INTERVAL, RESEED_INTERVAL, || {
+            counter += 1;
+            [counter; 32]
+        });
+        assert_eq!(out.len(), RESEED_INTERVAL);
+        assert_eq!(counter, 0); // Exactly one chunk, no reseed needed
+    }
+
+    #[test]
+    fn test_generate_reseeding_one_over() {
+        let seed = [42u8; 32];
+        let mut counter = 0u8;
+        let out = generate_reseeding(seed, RESEED_INTERVAL + 1, RESEED_INTERVAL, || {
+            counter += 1;
+            [counter; 32]
+        });
+        assert_eq!(out.len(), RESEED_INTERVAL + 1);
+        assert_eq!(counter, 1); // Exactly one reseed
+    }
+
+    #[test]
+    fn test_generate_reseeding_deterministic() {
+        let seed = [99u8; 32];
+        let reseed = || [77u8; 32];
+        let a = generate_reseeding(seed, RESEED_INTERVAL + 100, RESEED_INTERVAL, reseed);
+        let b = generate_reseeding(seed, RESEED_INTERVAL + 100, RESEED_INTERVAL, reseed);
+        assert_eq!(a, b);
+    }
 }

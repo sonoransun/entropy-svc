@@ -30,7 +30,13 @@ fn sys_getrandom(buf: &mut [u8]) -> Result<(), Error> {
             }
             return Err(Error::NoEntropy(format!("getrandom() failed: {}", err)));
         }
-        offset += ret as usize;
+        let n = ret as usize;
+        if n > buf.len() - offset {
+            return Err(Error::NoEntropy(
+                "getrandom() returned more bytes than requested".into(),
+            ));
+        }
+        offset += n;
     }
     Ok(())
 }
@@ -91,6 +97,24 @@ mod tests {
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             let buf = result.unwrap();
             assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_read_getrandom_single_byte() {
+        let result = read_getrandom(1);
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            let buf = result.unwrap();
+            assert_eq!(buf.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_read_getrandom_uniqueness() {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            let a = read_getrandom(32).unwrap();
+            let b = read_getrandom(32).unwrap();
+            assert_ne!(a, b);
         }
     }
 }

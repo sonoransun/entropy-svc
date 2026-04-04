@@ -58,7 +58,18 @@ pub fn dontdump_slice(buf: &[u8]) {
             );
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // macOS does not support MADV_DONTDUMP or MADV_NOCORE.
+        // Core dump exclusion is not available; mlock alone provides swap protection.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::debug!("MADV_DONTDUMP not available on macOS; core dump exclusion unsupported");
+        }
+        let _ = buf;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = buf;
     }
@@ -102,6 +113,18 @@ mod tests {
     fn test_lock_and_protect() {
         let buf = vec![0u8; 32];
         let _ = lock_and_protect(&buf);
+        munlock_slice(&buf);
+    }
+
+    #[test]
+    fn test_lock_and_protect_empty() {
+        assert!(lock_and_protect(&[]));
+    }
+
+    #[test]
+    fn test_mlock_munlock_roundtrip() {
+        let buf = vec![0u8; 4096];
+        let _ = mlock_slice(&buf);
         munlock_slice(&buf);
     }
 }

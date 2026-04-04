@@ -27,14 +27,10 @@ pub fn mix_entropy(inputs: &[(&str, &[u8])]) -> [u8; 32] {
         hasher.update(data);
     }
 
-    let result = hasher.finalize();
+    let mut result = hasher.finalize();
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&result);
-
-    // Zeroize the GenericArray result
-    let mut result_bytes = [0u8; 32];
-    result_bytes.copy_from_slice(&result);
-    zeroize_bytes(&mut result_bytes);
+    zeroize_bytes(result.as_mut_slice());
 
     seed
 }
@@ -58,16 +54,18 @@ pub fn mix_entropy_hkdf(inputs: &[(&str, &[u8])], output_len: usize) -> Vec<u8> 
         extract1.update((data.len() as u64).to_le_bytes());
         extract1.update(data);
     }
-    let pass1 = extract1.finalize();
+    let mut pass1 = extract1.finalize();
 
     // Second pass: re-hash with counter for additional extraction
     let mut extract2 = Blake2b256::new();
     extract2.update(b"mixrand-hkdf-extract2-v1");
-    extract2.update(pass1);
+    extract2.update(pass1.as_slice());
     extract2.update([0x01]); // counter byte
+    zeroize_bytes(pass1.as_mut_slice());
     let mut prk = [0u8; 32];
-    let prk_result = extract2.finalize();
+    let mut prk_result = extract2.finalize();
     prk.copy_from_slice(&prk_result);
+    zeroize_bytes(prk_result.as_mut_slice());
 
     // === Expand phase ===
     let mut output = Vec::with_capacity(output_len);
@@ -83,12 +81,13 @@ pub fn mix_entropy_hkdf(inputs: &[(&str, &[u8])], output_len: usize) -> Vec<u8> 
         }
         expand.update([counter]);
 
-        let block = expand.finalize();
+        let mut block = expand.finalize();
         let remaining = output_len - output.len();
         let to_copy = remaining.min(32);
         output.extend_from_slice(&block[..to_copy]);
 
         prev_block.copy_from_slice(&block);
+        zeroize_bytes(block.as_mut_slice());
         counter = counter.wrapping_add(1);
     }
 
@@ -173,5 +172,44 @@ mod tests {
     fn test_hkdf_empty_inputs() {
         let result = mix_entropy_hkdf(&[], 32);
         assert_eq!(result.len(), 32);
+    }
+
+    #[test]
+    fn test_hkdf_zero_output_length() {
+        let result = mix_entropy_hkdf(&[("test", b"data")], 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_hkdf_large_output() {
+        // 8192 bytes = 256 blocks, forces u8 counter to wrap
+        let out = mix_entropy_hkdf(&[("test", b"data")], 8192);
+        assert_eq!(out.len(), 8192);
+    }
+
+    #[test]
+    fn test_hkdf_prefix_consistency() {
+        let inputs: &[(&str, &[u8])] = &[("test", b"data")];
+        let short = mix_entropy_hkdf(inputs, 32);
+        let long = mix_entropy_hkdf(inputs, 64);
+        // First 32 bytes of 64-byte output should match the 32-byte output
+        assert_eq!(&short[..], &long[..32]);
+    }
+
+    #[test]
+    fn test_mix_entropy_many_inputs() {
+        let inputs: Vec<(&str, &[u8])> = (0..100)
+            .map(|_| ("label", b"data" as &[u8]))
+            .collect();
+        let result = mix_entropy(&inputs);
+        assert_eq!(result.len(), 32);
+    }
+
+    #[test]
+    fn test_mix_entropy_always_32_bytes() {
+        assert_eq!(mix_entropy(&[]).len(), 32);
+        assert_eq!(mix_entropy(&[("a", b"")]).len(), 32);
+        assert_eq!(mix_entropy(&[("a", &[0u8; 1024])]).len(), 32);
+        assert_eq!(mix_entropy(&[("a", b"x"), ("b", b"y"), ("c", b"z")]).len(), 32);
     }
 }

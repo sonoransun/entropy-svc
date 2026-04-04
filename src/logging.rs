@@ -96,6 +96,12 @@ fn rfc3339_now() -> String {
 }
 
 fn days_to_date(days: u64) -> (u64, u64, u64) {
+    // Guard against extreme values that could overflow the civil algorithm.
+    // Day 10,000,000 ≈ year 29,349 — well beyond any realistic timestamp.
+    if days > 10_000_000 {
+        return (9999, 12, 31);
+    }
+
     // Civil from days algorithm
     let z = days + 719468;
     let era = z / 146097;
@@ -270,5 +276,52 @@ mod tests {
         assert_eq!(level_tag(Level::Warn), "warning");
         assert_eq!(level_tag(Level::Info), "info");
         assert_eq!(level_tag(Level::Debug), "debug");
+    }
+
+    #[test]
+    fn test_log_level_to_level_filter() {
+        assert_eq!(LogLevel::Error.to_level_filter(), LevelFilter::Error);
+        assert_eq!(LogLevel::Warn.to_level_filter(), LevelFilter::Warn);
+        assert_eq!(LogLevel::Info.to_level_filter(), LevelFilter::Info);
+        assert_eq!(LogLevel::Debug.to_level_filter(), LevelFilter::Debug);
+    }
+
+    #[test]
+    fn test_days_to_date_leap_year() {
+        // 2000-01-01 is day 10957; Feb 29 = 10957 + 31 + 28 = 11016
+        let (y, m, d) = days_to_date(11016);
+        assert_eq!((y, m, d), (2000, 2, 29));
+    }
+
+    #[test]
+    fn test_days_to_date_year_boundary() {
+        // 1970 is not a leap year, so day 365 = 1971-01-01
+        let (y, m, d) = days_to_date(365);
+        assert_eq!((y, m, d), (1971, 1, 1));
+    }
+
+    #[test]
+    fn test_days_to_date_extreme() {
+        // Values above 10,000,000 should hit the guard and return (9999, 12, 31)
+        let (y, m, d) = days_to_date(10_000_001);
+        assert_eq!((y, m, d), (9999, 12, 31));
+
+        // 10,000,000 should NOT hit the guard — it should return a normal date
+        let (y2, m2, d2) = days_to_date(10_000_000);
+        assert_ne!((y2, m2, d2), (9999, 12, 31));
+    }
+
+    #[test]
+    fn test_rfc3339_now_format_structure() {
+        let ts = rfc3339_now();
+        assert_eq!(ts.len(), 24);
+        let bytes = ts.as_bytes();
+        assert_eq!(bytes[4], b'-');
+        assert_eq!(bytes[7], b'-');
+        assert_eq!(bytes[10], b'T');
+        assert_eq!(bytes[13], b':');
+        assert_eq!(bytes[16], b':');
+        assert_eq!(bytes[19], b'.');
+        assert_eq!(bytes[23], b'Z');
     }
 }

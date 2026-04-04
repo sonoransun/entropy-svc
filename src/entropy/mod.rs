@@ -411,7 +411,7 @@ fn health_check(bytes: &[u8]) -> bool {
     if bytes.len() < 8 {
         return true; // too few bytes for meaningful health check
     }
-    let mut ht = HealthTester::new(4.0);
+    let mut ht = HealthTester::new(crate::health::DEFAULT_MIN_ENTROPY_BITS);
     for chunk in bytes.chunks_exact(8) {
         let sample = u64::from_ne_bytes(chunk.try_into().unwrap());
         if ht.feed(sample).is_err() {
@@ -537,5 +537,32 @@ mod tests {
             let data = source.collect(32).unwrap();
             assert_eq!(data.len(), 32);
         }
+    }
+
+    #[test]
+    fn test_health_check_all_zeros_fails() {
+        assert!(!health_check(&[0u8; 256]));
+    }
+
+    #[test]
+    fn test_health_check_random_passes() {
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::{RngCore, SeedableRng};
+        let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
+        let mut data = vec![0u8; 256];
+        rng.fill_bytes(&mut data);
+        assert!(health_check(&data));
+    }
+
+    #[test]
+    fn test_health_check_small_data_passes() {
+        assert!(health_check(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_generate_large_request() {
+        let config = CpuRngConfig::default();
+        let result = generate(4096, &config).unwrap();
+        assert_eq!(result.bytes.len(), 4096);
     }
 }

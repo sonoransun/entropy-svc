@@ -122,7 +122,10 @@ impl CpuRngConfig {
             &mut warnings,
         );
 
-        if self.fallback_mix_bytes > 1024 {
+        if self.fallback_mix_bytes == 0 {
+            warnings.push("fallback_mix_bytes clamped from 0 to 8 (minimum)".into());
+            self.fallback_mix_bytes = 8;
+        } else if self.fallback_mix_bytes > 1024 {
             warnings.push(format!(
                 "fallback_mix_bytes clamped from {} to 1024",
                 self.fallback_mix_bytes
@@ -331,7 +334,7 @@ mod tests {
         assert_eq!(cfg.rndr_retries, 1);
         assert_eq!(cfg.rndrrs_retries, 1);
         assert_eq!(cfg.xstore_quality, 0); // 0 is valid minimum
-        assert_eq!(cfg.fallback_mix_bytes, 0); // 0 is valid minimum
+        assert_eq!(cfg.fallback_mix_bytes, 8); // 0 clamped to minimum 8
         assert_eq!(cfg.oversample, 1);
         assert!(warnings.len() >= 4); // retries + oversample
     }
@@ -420,5 +423,89 @@ prefer = "rdrand"
         let deserialized: CpuRngConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(deserialized.prefer, cfg.prefer);
         assert_eq!(deserialized.oversample, cfg.oversample);
+    }
+
+    #[test]
+    fn test_invalid_toml_syntax() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("mixrand_test_invalid_toml.toml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            write!(f, "[cpu_rng\nnot valid toml!!!").unwrap();
+        }
+        let result = load_config(Some(&path));
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_env_override_invalid_bool() {
+        // Use XSTORE to avoid conflicting with other env var tests
+        let mut cfg = CpuRngConfig::default();
+        std::env::set_var("MIXRAND_ENABLE_XSTORE", "maybe");
+        apply_env_overrides(&mut cfg);
+        assert!(cfg.enable_xstore);
+        std::env::remove_var("MIXRAND_ENABLE_XSTORE");
+    }
+
+    #[test]
+    fn test_env_override_invalid_u32() {
+        // Use RDSEED_RETRIES to avoid conflicting with other env var tests
+        let mut cfg = CpuRngConfig::default();
+        std::env::set_var("MIXRAND_RDSEED_RETRIES", "notanumber");
+        apply_env_overrides(&mut cfg);
+        assert_eq!(cfg.rdseed_retries, 10);
+        std::env::remove_var("MIXRAND_RDSEED_RETRIES");
+    }
+
+    #[test]
+    fn test_env_override_all_bool_formats() {
+        // Use RNDR to avoid conflicting with other env var tests
+        for (val, expected) in &[
+            ("true", true),
+            ("1", true),
+            ("yes", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+        ] {
+            let mut cfg = CpuRngConfig::default();
+            std::env::set_var("MIXRAND_ENABLE_RNDR", val);
+            apply_env_overrides(&mut cfg);
+            assert_eq!(cfg.enable_rndr, *expected, "failed for input {:?}", val);
+        }
+        std::env::remove_var("MIXRAND_ENABLE_RNDR");
+    }
+
+    #[test]
+    fn test_validate_exact_max_boundary() {
+        let mut cfg = CpuRngConfig {
+            rdrand_retries: 100,
+            rdseed_retries: 100,
+            rndr_retries: 100,
+            rndrrs_retries: 100,
+            xstore_quality: 3,
+            oversample: 16,
+            fallback_mix_bytes: 1024,
+            ..Default::default()
+        };
+        let warnings = cfg.validate();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_exact_min_boundary() {
+        let mut cfg = CpuRngConfig {
+            rdrand_retries: 1,
+            rdseed_retries: 1,
+            rndr_retries: 1,
+            rndrrs_retries: 1,
+            xstore_quality: 0,
+            oversample: 1,
+            fallback_mix_bytes: 8,
+            ..Default::default()
+        };
+        let warnings = cfg.validate();
+        assert!(warnings.is_empty());
     }
 }

@@ -93,6 +93,9 @@ fn write_uuencode(bytes: &[u8], out: &mut dyn Write) -> io::Result<()> {
 
         // Encode 3 bytes at a time into 4 characters
         for triple in chunk.chunks(3) {
+            // Zero-pad the final triple if fewer than 3 bytes remain.
+            // This is standard uuencode behavior: trailing encoded
+            // characters represent zero-filled padding bytes.
             let mut buf = [0u8; 3];
             for (i, &b) in triple.iter().enumerate() {
                 buf[i] = b;
@@ -186,5 +189,47 @@ mod tests {
         let out = format_to_string(&[0x43, 0x61, 0x74], &OutputFormat::Uuencode);
         assert!(out.starts_with("begin 644 data\n"));
         assert!(out.ends_with("`\nend\n"));
+    }
+
+    #[test]
+    fn test_write_output_to_file_hex() {
+        let path = std::env::temp_dir().join("mixrand_test_hex_output.txt");
+        write_output(&[0xde, 0xad], &OutputFormat::Hex, Some(&path)).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "dead\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_write_output_to_file_raw() {
+        let path = std::env::temp_dir().join("mixrand_test_raw_output.bin");
+        write_output(&[0x01, 0x02, 0x03], &OutputFormat::Raw, Some(&path)).unwrap();
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, [0x01, 0x02, 0x03]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_format_output_empty_bytes() {
+        let hex = format_to_string(&[], &OutputFormat::Hex);
+        assert_eq!(hex, "\n");
+
+        let mut raw_buf = Vec::new();
+        format_output(&[], &OutputFormat::Raw, &mut raw_buf).unwrap();
+        assert!(raw_buf.is_empty());
+
+        let b64 = format_to_string(&[], &OutputFormat::Base64);
+        assert_eq!(b64, "\n");
+    }
+
+    #[test]
+    fn test_uuencode_full_line() {
+        let data: Vec<u8> = (0u8..45).collect();
+        let out = format_to_string(&data, &OutputFormat::Uuencode);
+        assert!(out.starts_with("begin 644 data\n"));
+        assert!(out.ends_with("`\nend\n"));
+        let lines: Vec<&str> = out.lines().collect();
+        // Second line (index 1) is the encoded data line; length char = 45 + 32 = 77 = 'M'
+        assert!(lines[1].starts_with('M'));
     }
 }

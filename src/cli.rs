@@ -265,3 +265,39 @@ pub fn print_completions(shell: Shell) {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, "mixrand", &mut std::io::stdout());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_parse_defaults() {
+        let cli = Cli::try_parse_from(["mixrand"]).unwrap();
+        assert_eq!(cli.bytes, 32);
+        assert!(matches!(cli.format, OutputFormat::Hex));
+        assert_eq!(cli.verbose, false);
+        assert_eq!(cli.quiet, false);
+        assert!(cli.command.is_none());
+        assert!(cli.count.is_none());
+    }
+
+    #[test]
+    fn test_cli_parse_with_args() {
+        let cli = Cli::try_parse_from(["mixrand", "-n", "64", "-f", "base64", "-v"]).unwrap();
+        assert_eq!(cli.bytes, 64);
+        assert!(matches!(cli.format, OutputFormat::Base64));
+        assert_eq!(cli.verbose, true);
+    }
+
+    #[test]
+    fn test_cli_parse_check_subcommand() {
+        let cli = Cli::try_parse_from(["mixrand", "check", "-d", "30s"]).unwrap();
+        match cli.command {
+            Some(Command::Check(args)) => {
+                assert_eq!(args.duration, "30s");
+            }
+            other => panic!("expected Some(Command::Check(_)), got {:?}", other),
+        }
+    }
+}
