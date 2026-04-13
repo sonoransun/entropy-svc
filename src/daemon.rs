@@ -1,11 +1,11 @@
 use crate::cli::DaemonArgs;
 #[cfg(target_os = "linux")]
 use crate::config;
-use crate::config::CpuRngConfig;
+use crate::config::Config;
 use crate::error::Error;
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_args: &DaemonArgs, _cpu_config: &CpuRngConfig) -> Result<(), Error> {
+pub fn run(_args: &DaemonArgs, _config: &Config) -> Result<(), Error> {
     Err(Error::InvalidArgs(
         "daemon mode is only supported on Linux".into(),
     ))
@@ -268,16 +268,21 @@ fn health_check_bytes(data: &[u8], health: &mut HealthTester) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn reload_config(config_path: Option<&Path>, cpu_config: &mut CpuRngConfig) {
+fn reload_config(config_path: Option<&Path>, full_config: &mut Config) {
     match config::load_config(config_path) {
         Ok(c) => {
-            let mut new_cfg = c.cpu_rng;
-            config::apply_env_overrides(&mut new_cfg);
-            let warnings = new_cfg.validate();
+            let mut new_cfg = c;
+            config::apply_env_overrides(&mut new_cfg.cpu_rng);
+            config::apply_hsm_env_overrides(&mut new_cfg.hsm);
+            let warnings = new_cfg.cpu_rng.validate();
             for w in warnings {
                 log::warn!(target: "mixrand::daemon", "config: {}", w);
             }
-            *cpu_config = new_cfg;
+            let hsm_warnings = new_cfg.hsm.validate();
+            for w in hsm_warnings {
+                log::warn!(target: "mixrand::daemon", "config: {}", w);
+            }
+            *full_config = new_cfg;
             log::info!(target: "mixrand::daemon", "config reloaded successfully");
         }
         Err(e) => {
@@ -287,7 +292,7 @@ fn reload_config(config_path: Option<&Path>, cpu_config: &mut CpuRngConfig) {
 }
 
 #[cfg(target_os = "linux")]
-pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
+pub fn run(args: &DaemonArgs, config: &Config) -> Result<(), Error> {
     if args.batch_size == 0 {
         return Err(Error::InvalidArgs("batch-size must be greater than 0".into()));
     }
@@ -318,7 +323,7 @@ pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     }
 
     let config_path: Option<PathBuf> = args.config_file.clone();
-    let mut cpu_config = cpu_config.clone();
+    let mut full_config = config.clone();
 
     log::info!(
         target: "mixrand::daemon",
@@ -342,13 +347,13 @@ pub fn run(args: &DaemonArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
         // Check for config reload signal
         if RELOAD.swap(false, Ordering::Acquire) {
             log::info!(target: "mixrand::daemon", "SIGHUP received, reloading config");
-            reload_config(config_path.as_deref(), &mut cpu_config);
+            reload_config(config_path.as_deref(), &mut full_config);
         }
 
         match read_entropy_avail() {
             Ok(avail) => {
                 if avail < args.threshold {
-                    match entropy::generate(args.batch_size, &cpu_config) {
+                    match entropy::generate(args.batch_size, &full_config) {
                         Ok(result) => {
                             let mut data = result.bytes;
                             memlock::lock_and_protect(&data);

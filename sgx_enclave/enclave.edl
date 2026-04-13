@@ -1,0 +1,7 @@
+/* Enclave Definition Language file for mixrand SGX entropy enclave */
+enclave {
+    trusted {
+        /* Generate random bytes using sgx_read_rand inside the enclave */
+        public int ecall_get_random([out, size=len] uint8_t *buf, size_t len);
+    };
+};

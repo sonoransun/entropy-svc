@@ -45,9 +45,33 @@ mixrand check -d 30s
 sudo mixrand daemon
 ```
 
+### HSM Quick Start
+
+```bash
+# Build with HSM and secure element support
+cargo build --release --features hsm
+
+# List all available sources including HSM devices
+mixrand list-sources
+
+# Generate a key using TPM2 hardware entropy
+mixrand -n 32 -f hex --enable-tpm2
+
+# Use a PKCS#11 HSM (e.g., SoftHSM, YubiHSM, Thales Luna)
+mixrand -n 64 -f base64 --pkcs11-library /usr/lib/softhsm/libsofthsm2.so
+
+# Use GnuPG entropy (no extra build deps needed)
+cargo build --release --features gnupg
+mixrand -n 32 --enable-gnupg
+
+# Run statistical tests against all HSM sources
+mixrand check -d 1m --sources=tpm2,pkcs11,gnupg
+```
+
 ## Features
 
-- **Multi-source entropy**: Priority-ordered cascade across hardware RNG, CPU instructions (RDSEED, RDRAND, XSTORE, RNDR, RNDRRS), haveged, getrandom syscall, and a fallback mixer
+- **Multi-source entropy**: Priority-ordered cascade across HSMs, secure elements, hardware RNG, CPU instructions (RDSEED, RDRAND, XSTORE, RNDR, RNDRRS), haveged, getrandom syscall, and a fallback mixer
+- **HSM & secure element support** *(feature-gated)*: Intel SGX, TPM 2.0, PKCS#11 (SoftHSM/YubiHSM/Thales/CloudHSM), PC/SC smart cards (JavaCard, OpenPGP), YubiKey PIV, YubiHSM 2 native, and GnuPG subprocess
 - **Cross-platform CPU RNG**: x86_64 (RDSEED/RDRAND/XSTORE via inline asm) and AArch64 (RNDR/RNDRRS for Apple Silicon and ARM servers)
 - **Dual mixer modes**: BLAKE2b-256 single-pass (default) or HKDF-style two-stage extract-then-expand for low-entropy inputs
 - **ChaCha20 CSPRNG**: Deterministic expansion with automatic reseeding every 1 MiB for large requests
@@ -76,6 +100,7 @@ flowchart LR
 
     subgraph Core["Core Pipeline"]
         F["Entropy Sources<br/><i>trait EntropySource</i>"]
+        F2["HSM Sources<br/><i>SGX, TPM2, PKCS#11,<br/>PC/SC, YubiKey, GnuPG</i>"]
         G["Health Testing<br/><i>NIST SP 800-90B</i>"]
         H["Mixer<br/><i>BLAKE2b or HKDF</i>"]
         I["CSPRNG<br/><i>ChaCha20 + reseed</i>"]
@@ -88,9 +113,12 @@ flowchart LR
     end
 
     A --> F
+    A --> F2
     B --> F
     C --> F
+    C --> F2
     F --> G --> H --> I
+    F2 --> G
     Security -.-> Core
 
     A -- "formatted bytes" --> M["stdout / file"]
@@ -299,10 +327,10 @@ Four configuration layers merge in order — later layers override earlier ones.
 
 ```mermaid
 flowchart LR
-    D["<b>Defaults</b><br/><code>CpuRngConfig::default()</code>"]
-    T["<b>TOML File</b><br/><code>/etc/mixrand.toml</code><br/><i>or --config path</i>"]
-    E["<b>Environment</b><br/><code>MIXRAND_*</code> vars"]
-    C["<b>CLI Flags</b><br/><code>--enable-rdseed</code>, etc."]
+    D["<b>Defaults</b><br/><code>CpuRngConfig::default()</code><br/><code>HsmConfig::default()</code>"]
+    T["<b>TOML File</b><br/><code>/etc/mixrand.toml</code><br/><i>[cpu_rng] + [hsm.*]</i>"]
+    E["<b>Environment</b><br/><code>MIXRAND_*</code> vars<br/><i>MIXRAND_TPM2_*, etc.</i>"]
+    C["<b>CLI Flags</b><br/><code>--enable-rdseed</code><br/><code>--enable-tpm2</code>, etc."]
 
     D --> T --> E --> C --> Final(["Final Config<br/><i>validated and clamped</i>"])
 ```
@@ -319,6 +347,7 @@ flowchart TD
         T2["<b>Weak Entropy Source</b><br/>Multi-source mixing<br/>Domain-separated hashing<br/>Length-prefixed inputs<br/>SP 800-90B health tests"]
         T3["<b>Large Request Exhaustion</b><br/>ChaCha20 reseeds every 1 MiB<br/>Fresh entropy at each boundary<br/>100 MiB max per generation"]
         T4["<b>Privilege Escalation</b><br/>Daemon drops to unprivileged user<br/>after opening /dev/random"]
+        T5["<b>HSM Session Leaks</b><br/>Session-per-call pattern<br/>PIN/password via env vars only<br/>TPM resource manager isolation"]
     end
 
     subgraph Primitives["Cryptographic Primitives"]
@@ -333,6 +362,161 @@ flowchart TD
         U3["libc FFI<br/><i>ioctl, mlock, sigaction,<br/>getpwnam, clock_gettime</i>"]
     end
 ```
+
+### HSM & Secure Element Integration
+
+Mixrand supports hardware security modules and secure elements as high-priority entropy sources. When compiled with the appropriate feature flags, HSM sources are tried before CPU and system sources in the priority cascade.
+
+#### Full Source Priority Cascade
+
+```mermaid
+flowchart TD
+    Start([Generate Request]) --> Gate{"Feature flags<br/>+ enabled config?"}
+
+    Gate -- "sgx" --> SGX["<b>Intel SGX</b><br/><i>Priority 4</i><br/>sgx_read_rand via RDRAND"]
+    Gate -- "tpm2" --> TPM["<b>TPM 2.0</b><br/><i>Priority 5</i><br/>TPM2_GetRandom"]
+    Gate -- "pkcs11" --> P11["<b>PKCS#11</b><br/><i>Priority 6</i><br/>C_GenerateRandom"]
+    Gate -- "yubihsm-native" --> YH["<b>YubiHSM 2</b><br/><i>Priority 6</i><br/>GetPseudoRandom"]
+    Gate -- "yubikey" --> YK["<b>YubiKey</b><br/><i>Priority 7</i><br/>PIV GET CHALLENGE"]
+    Gate -- "pcsc" --> PC["<b>PC/SC Card</b><br/><i>Priority 7</i><br/>ISO 7816 GET CHALLENGE"]
+    Gate -- "gnupg" --> GPG["<b>GnuPG</b><br/><i>Priority 8</i><br/>gpg --gen-random"]
+    Gate -- "always" --> HW["<b>/dev/hwrng</b><br/><i>Priority 10</i>"]
+    Gate -- "always" --> CPU["<b>CPU RNG</b><br/><i>Priority 20</i><br/>RDRAND/RDSEED/RNDR"]
+    Gate -- "always" --> HAV["<b>haveged</b><br/><i>Priority 30</i>"]
+    Gate -- "always" --> FB["<b>Fallback Mixer</b><br/><i>Priority 40</i><br/>getrandom + procfs + jitter"]
+
+    SGX --> Health{"Health Check<br/><i>SP 800-90B</i>"}
+    TPM --> Health
+    P11 --> Health
+    YH --> Health
+    YK --> Health
+    PC --> Health
+    GPG --> Health
+    HW --> Health
+    CPU --> Health
+    HAV --> Health
+    FB --> Health
+
+    Health -- Pass --> Output([Output Bytes])
+    Health -- Fail --> Next["Try next source<br/>in priority order"]
+    Next --> Gate
+```
+
+#### PKCS#11 Session Flow
+
+PKCS#11 provides a standard interface to any compliant HSM. Mixrand opens a session per `collect()` call to ensure thread safety.
+
+```mermaid
+sequenceDiagram
+    participant App as mixrand
+    participant Lib as PKCS#11 Library<br/>(dlopen)
+    participant Token as HSM / Token
+
+    App->>Lib: Pkcs11::new(library_path)
+    Lib-->>App: Handle
+
+    App->>Lib: C_Initialize(OsThreads)
+    Lib-->>App: OK
+
+    App->>Lib: C_GetSlotList(tokenPresent=true)
+    Lib-->>App: [slot_0, slot_1, ...]
+
+    App->>Lib: C_OpenSession(slot_0, RO)
+    Lib->>Token: Open session
+    Token-->>Lib: session_handle
+    Lib-->>App: session
+
+    opt PIN configured
+        App->>Lib: C_Login(session, UserType::User, PIN)
+        Lib->>Token: Authenticate
+        Token-->>Lib: OK
+        Lib-->>App: OK
+    end
+
+    App->>Lib: C_GenerateRandom(session, count)
+    Lib->>Token: Generate random bytes
+    Token-->>Lib: random_bytes
+    Lib-->>App: Vec<u8>
+
+    App->>Lib: C_CloseSession(session)
+    Note over App: Zeroize intermediates
+```
+
+#### Smart Card (PC/SC) APDU Flow
+
+PC/SC sources (including YubiKey) use ISO 7816-4 GET CHALLENGE APDUs to request random bytes from the card.
+
+```mermaid
+sequenceDiagram
+    participant App as mixrand
+    participant PCSC as PC/SC Daemon<br/>(pcscd)
+    participant Card as Smart Card /<br/>YubiKey
+
+    App->>PCSC: Context::establish(User)
+    PCSC-->>App: context
+
+    App->>PCSC: list_readers()
+    PCSC-->>App: [reader_0, reader_1, ...]
+    Note over App: Filter by name<br/>("Yubico" for YubiKey)
+
+    App->>PCSC: connect(reader, Shared)
+    PCSC->>Card: ATR exchange
+    Card-->>PCSC: ATR bytes
+    PCSC-->>App: card handle
+
+    opt YubiKey mode
+        App->>Card: SELECT PIV<br/>00 A4 04 00 05<br/>A0 00 00 03 08
+        Card-->>App: SW=9000
+    end
+
+    loop Until count bytes collected
+        App->>Card: GET CHALLENGE<br/>00 84 00 00 [Le]
+        Card-->>App: random_bytes + SW=9000
+        Note over App: Append to result
+    end
+
+    Note over App: Truncate to count,<br/>zeroize intermediates
+```
+
+#### TPM 2.0 Entropy Flow
+
+```mermaid
+flowchart LR
+    subgraph TPM["TPM 2.0 Flow"]
+        A["Parse TCTI string<br/><code>device:/dev/tpmrm0</code>"] --> B["Create Context<br/><code>tss_esapi::Context</code>"]
+        B --> C{"Remaining<br/>bytes > 0?"}
+        C -- Yes --> D["TPM2_GetRandom<br/><i>max 48 bytes/call</i>"]
+        D --> E["Append to buffer"]
+        E --> C
+        C -- No --> F["Close context"]
+    end
+
+    F --> G["Health Check<br/><i>SP 800-90B</i>"]
+    G -- Pass --> H([Output])
+    G -- Fail --> I["Try next source"]
+```
+
+#### Per-Source Details
+
+| Source | Feature Flag | System Library | Prerequisites |
+|--------|-------------|----------------|---------------|
+| **SGX** | `sgx` | `libsgx_urts` (runtime) | Intel SGX CPU + driver (`/dev/sgx_enclave`) |
+| **TPM2** | `tpm2` | `libtss2-dev` (compile) | TPM 2.0 chip + `/dev/tpmrm0` |
+| **PKCS#11** | `pkcs11` | None (runtime dlopen) | Vendor PKCS#11 `.so` library |
+| **YubiHSM** | `yubihsm-native` | None (pure Rust) | YubiHSM 2 + `yubihsm-connector` |
+| **YubiKey** | `yubikey` | `libpcsclite-dev` (compile) | YubiKey + USB reader + `pcscd` |
+| **PC/SC** | `pcsc` | `libpcsclite-dev` (compile) | Smart card + reader + `pcscd` |
+| **GnuPG** | `gnupg` | None | `gpg` binary on `$PATH` |
+
+**PKCS#11 compatible devices** (use the `pkcs11` source with the appropriate library path):
+
+| Device | Library Path |
+|--------|-------------|
+| SoftHSM 2 | `/usr/lib/softhsm/libsofthsm2.so` |
+| YubiHSM 2 | `/usr/lib/libyubihsm_pkcs11.so` |
+| Thales Luna | `/usr/lib/libCryptoki2_64.so` |
+| AWS CloudHSM | `/opt/cloudhsm/lib/libcloudhsm_pkcs11.so` |
+| Nitrokey HSM | `/usr/lib/opensc-pkcs11.so` |
 
 ## Use Cases
 
@@ -436,12 +620,115 @@ mixrand completions zsh > ~/.zfunc/_mixrand
 mixrand completions fish > ~/.config/fish/completions/mixrand.fish
 ```
 
+### HSM-Backed Key Generation
+
+```bash
+# TPM2 entropy for defense-in-depth key generation
+mixrand -n 32 -f hex --enable-tpm2
+
+# PKCS#11 HSM entropy (e.g., with SoftHSM for testing)
+MIXRAND_PKCS11_PIN=1234 mixrand -n 64 -f base64 \
+  --pkcs11-library /usr/lib/softhsm/libsofthsm2.so
+
+# YubiHSM 2 via native connector
+MIXRAND_YUBIHSM_PASSWORD=password mixrand -n 32 -f hex --enable-yubihsm
+
+# YubiKey PIV entropy (requires YubiKey inserted)
+mixrand -n 32 -f hex --enable-yubikey
+
+# GnuPG entropy (no hardware needed, just gpg on PATH)
+mixrand -n 32 -f hex --enable-gnupg
+```
+
+### Smart Card Entropy for Air-Gapped Systems
+
+```bash
+# Use any ISO 7816 smart card (JavaCard, OpenPGP card)
+mixrand -n 256 -f raw -o seed.bin --enable-pcsc
+
+# Validate smart card entropy quality
+mixrand check -d 5m --sources=pcsc,yubikey
+
+# Compare smart card entropy against CPU and system sources
+mixrand check -d 1m --output-format json
+```
+
+### Multi-Source Entropy Ceremony
+
+For high-assurance key generation, combine multiple independent entropy sources:
+
+```bash
+# Build with all HSM sources
+cargo build --release --features all-sources
+
+# Verify which sources are available on this machine
+mixrand list-sources
+
+# Generate a key — mixrand automatically uses the highest-priority
+# available source, with health check fallback through the cascade
+mixrand -n 32 -f hex -v  # verbose shows which source was used
+
+# Run deep statistical tests on all sources (5 minutes)
+mixrand check -d 5m --output-format json -o entropy_report.json
+```
+
+### Production HSM Deployment
+
+```bash
+# Configure via TOML for production servers
+cat > /etc/mixrand.toml << 'EOF'
+[cpu_rng]
+prefer = "rdseed"
+oversample = 4
+
+[hsm.tpm2]
+enabled = true
+
+[hsm.pkcs11]
+enabled = true
+library_path = "/opt/cloudhsm/lib/libcloudhsm_pkcs11.so"
+slot_id = 0
+EOF
+
+# Set HSM credentials via environment (never in config files)
+export MIXRAND_PKCS11_PIN="hsm-session-pin"
+
+# Run daemon with HSM-supplemented entropy feeding the kernel pool
+sudo mixrand daemon --threshold 384 --batch-size 128 --syslog
+```
+
 ## Installation
 
 ```bash
+# Core build (no HSM dependencies)
 cargo build --release
 sudo cp target/release/mixrand /usr/local/bin/
+
+# With GnuPG support (no system library deps)
+cargo build --release --features gnupg
+
+# With all standard HSM sources
+# Prerequisites: apt install libtss2-dev libpcsclite-dev  (Debian/Ubuntu)
+#                dnf install tpm2-tss-devel pcsc-lite-devel (Fedora)
+cargo build --release --features hsm
+
+# With everything (including YubiHSM native + SGX)
+cargo build --release --features all-sources
 ```
+
+### Feature Flags
+
+| Feature | Description | System Library |
+|---------|-------------|----------------|
+| `pkcs11` | PKCS#11 generic HSM interface | None (runtime dlopen) |
+| `tpm2` | TPM 2.0 entropy via ESAPI | `libtss2-dev` |
+| `pcsc` | PC/SC smart card support | `libpcsclite-dev` |
+| `yubikey` | YubiKey PIV applet (implies `pcsc`) | `libpcsclite-dev` |
+| `gnupg` | GnuPG subprocess | None |
+| `yubihsm-native` | YubiHSM 2 direct HTTP/USB | None (pure Rust) |
+| `sgx` | Intel SGX enclave entropy | None (runtime `libsgx_urts`) |
+| `hsm` | Meta: pkcs11 + tpm2 + pcsc + yubikey + gnupg | All of the above |
+| `all-sources` | Meta: hsm + yubihsm-native + sgx | All of the above |
 
 ## Usage Reference
 
@@ -526,6 +813,20 @@ mixrand completions <SHELL>      # Generate shell completions (bash, zsh, fish, 
       --mixer-mode <MODE>         Mixer [blake2b|hkdf] (default: blake2b)
 ```
 
+### HSM options (available on all commands, requires feature flags)
+
+```bash
+      --enable-tpm2 [BOOL]        Enable/disable TPM 2.0 source
+      --enable-pkcs11 [BOOL]      Enable/disable PKCS#11 source
+      --enable-pcsc [BOOL]        Enable/disable PC/SC smart card source
+      --enable-yubikey [BOOL]     Enable/disable YubiKey source
+      --enable-gnupg [BOOL]       Enable/disable GnuPG source
+      --enable-yubihsm [BOOL]     Enable/disable YubiHSM native source
+      --enable-sgx [BOOL]         Enable/disable Intel SGX source
+      --pkcs11-library <PATH>     Path to PKCS#11 .so library
+      --tpm2-device <PATH>        TPM2 device path (default: /dev/tpmrm0)
+```
+
 ## Configuration
 
 ### TOML file
@@ -548,6 +849,40 @@ prefer = "rdseed"           # rdseed | rdrand | xstore | rndr | rndrrs
 fallback_mix_bytes = 32     # CPU entropy bytes mixed into fallback (8-1024)
 oversample = 2              # standalone CPU RNG oversample ratio (1-16)
 mixer_mode = "blake2b"      # blake2b | hkdf
+
+[hsm.tpm2]
+enabled = true
+tcti = "device:/dev/tpmrm0"   # TCTI connection string
+
+[hsm.pkcs11]
+enabled = true
+library_path = "/usr/lib/softhsm/libsofthsm2.so"
+slot_id = 0
+# pin — set via MIXRAND_PKCS11_PIN env var (never in config files)
+
+[hsm.pcsc]
+enabled = true
+# reader = "Yubico"           # optional reader name filter (substring)
+max_le = 32                    # max bytes per GET CHALLENGE APDU (1-255)
+
+[hsm.yubikey]
+enabled = true
+# serial = 12345678            # optional: specific YubiKey serial number
+
+[hsm.gnupg]
+enabled = true
+# gpg_path = "/usr/bin/gpg2"   # override gpg binary path
+quality_level = 2              # 0=low, 1=medium, 2=high (default)
+
+[hsm.yubihsm]
+enabled = true
+connector_url = "http://127.0.0.1:12345"
+auth_key_id = 1
+# password — set via MIXRAND_YUBIHSM_PASSWORD env var
+
+[hsm.sgx]
+enabled = true
+# enclave_path = "/usr/lib/mixrand_entropy_enclave.signed.so"
 ```
 
 ### Environment variables
@@ -571,6 +906,31 @@ All settings can be overridden via `MIXRAND_*` environment variables (layer betw
 | `MIXRAND_OVERSAMPLE` | u32 | `4` |
 | `MIXRAND_MIXER_MODE` | string | `blake2b`, `hkdf` |
 
+#### HSM environment variables
+
+| Variable | Type | Example |
+|---|---|---|
+| `MIXRAND_TPM2_ENABLED` | bool | `true` |
+| `MIXRAND_TPM2_TCTI` | string | `device:/dev/tpmrm0` |
+| `MIXRAND_PKCS11_ENABLED` | bool | `true` |
+| `MIXRAND_PKCS11_LIBRARY_PATH` | string | `/usr/lib/softhsm/libsofthsm2.so` |
+| `MIXRAND_PKCS11_SLOT_ID` | u64 | `0` |
+| `MIXRAND_PKCS11_PIN` | string | *(sensitive — env var only)* |
+| `MIXRAND_PCSC_ENABLED` | bool | `true` |
+| `MIXRAND_PCSC_READER` | string | `Yubico` |
+| `MIXRAND_PCSC_MAX_LE` | u8 | `32` |
+| `MIXRAND_YUBIKEY_ENABLED` | bool | `true` |
+| `MIXRAND_YUBIKEY_SERIAL` | u32 | `12345678` |
+| `MIXRAND_GNUPG_ENABLED` | bool | `true` |
+| `MIXRAND_GNUPG_GPG_PATH` | string | `/usr/bin/gpg2` |
+| `MIXRAND_GNUPG_QUALITY_LEVEL` | u8 | `2` |
+| `MIXRAND_YUBIHSM_ENABLED` | bool | `true` |
+| `MIXRAND_YUBIHSM_CONNECTOR_URL` | string | `http://127.0.0.1:12345` |
+| `MIXRAND_YUBIHSM_AUTH_KEY_ID` | u16 | `1` |
+| `MIXRAND_YUBIHSM_PASSWORD` | string | *(sensitive — env var only)* |
+| `MIXRAND_SGX_ENABLED` | bool | `true` |
+| `MIXRAND_SGX_ENCLAVE_PATH` | string | `/usr/lib/mixrand_entropy_enclave.signed.so` |
+
 ## API and Implementation Reference
 
 ### EntropySource Trait
@@ -590,21 +950,28 @@ pub trait EntropySource: Send + Sync {
 
 ### Entropy Sources
 
-| Source | Priority | Type | Platform | Description |
-|--------|----------|------|----------|-------------|
-| `hwrng` | 10 | hardware | Linux | `/dev/hwrng` device |
-| `cpurng` | 20 | hardware | all | Best available CPU instruction (with oversampling) |
-| `rdseed` | 21 | hardware | x86_64 | Intel/AMD RDSEED instruction |
-| `rdrand` | 22 | hardware | x86_64 | Intel/AMD RDRAND instruction |
-| `xstore` | 23 | hardware | x86_64 | VIA PadLock XSTORE instruction |
-| `rndr` | 24 | hardware | AArch64 | ARM FEAT_RNG RNDR instruction |
-| `rndrrs` | 25 | hardware | AArch64 | ARM FEAT_RNG RNDRRS (reseeded) |
-| `haveged` | 30 | system | Linux | `/dev/random` when haveged process is running |
-| `getrandom` | 35 | system | Linux/macOS | `getrandom(2)` / `getentropy(3)` syscall |
-| `urandom` | 36 | system | Unix | `/dev/urandom` device |
-| `fallback` | 40 | software | all | Multi-source mix (getrandom + procfs + jitter + CPU) |
+| Source | Priority | Type | Platform | Feature | Description |
+|--------|----------|------|----------|---------|-------------|
+| `sgx` | 4 | hardware | Linux x86_64 | `sgx` | Intel SGX enclave entropy (RDRAND with SGX verification) |
+| `tpm2` | 5 | hardware | Linux | `tpm2` | TPM 2.0 `TPM2_GetRandom` via ESAPI |
+| `pkcs11` | 6 | hardware | all | `pkcs11` | PKCS#11 `C_GenerateRandom` (any compliant token) |
+| `yubihsm` | 6 | hardware | all | `yubihsm-native` | YubiHSM 2 `GetPseudoRandom` via HTTP connector |
+| `yubikey` | 7 | hardware | all | `yubikey` | YubiKey PIV applet GET CHALLENGE |
+| `pcsc` | 7 | hardware | all | `pcsc` | PC/SC smart card ISO 7816 GET CHALLENGE |
+| `gnupg` | 8 | software | all | `gnupg` | GnuPG `gpg --gen-random` subprocess |
+| `hwrng` | 10 | hardware | Linux | — | `/dev/hwrng` device |
+| `cpurng` | 20 | hardware | all | — | Best available CPU instruction (with oversampling) |
+| `rdseed` | 21 | hardware | x86_64 | — | Intel/AMD RDSEED instruction |
+| `rdrand` | 22 | hardware | x86_64 | — | Intel/AMD RDRAND instruction |
+| `xstore` | 23 | hardware | x86_64 | — | VIA PadLock XSTORE instruction |
+| `rndr` | 24 | hardware | AArch64 | — | ARM FEAT_RNG RNDR instruction |
+| `rndrrs` | 25 | hardware | AArch64 | — | ARM FEAT_RNG RNDRRS (reseeded) |
+| `haveged` | 30 | system | Linux | — | `/dev/random` when haveged process is running |
+| `getrandom` | 35 | system | Linux/macOS | — | `getrandom(2)` / `getentropy(3)` syscall |
+| `urandom` | 36 | system | Unix | — | `/dev/urandom` device |
+| `fallback` | 40 | software | all | — | Multi-source mix (getrandom + procfs + jitter + CPU) |
 
-The main `generate()` function uses 4 sources (hwrng, cpurng, haveged, fallback). The `check` command probes all 10 granular sources for per-instruction statistical testing.
+The main `generate()` function uses core sources (hwrng, cpurng, haveged, fallback) plus any enabled HSM sources. Sources are sorted by priority and tried in order. The `check` command probes all granular sources including HSM devices for per-source statistical testing.
 
 ### Mixer Modes
 
@@ -687,6 +1054,33 @@ CPU instruction availability is detected at runtime via CPUID (x86_64) or `getau
 - **Input validation**: Byte count capped at 100 MiB, iteration count at 10,000, and sample size at 10 MiB to prevent resource exhaustion.
 - **Atomic ordering**: Signal handler flags use `Release`/`Acquire` ordering for correct visibility on weak memory architectures (ARM, RISC-V).
 - **Unsafe code boundaries**: Limited to inline x86_64/AArch64 asm (CPUID, RDRAND, RDSEED, XSTORE, RNDR, RNDRRS), volatile writes for zeroization, and libc FFI (ioctl, mlock, sigaction, getpwnam, clock_gettime).
+- **HSM session isolation**: PKCS#11, TPM2, and PC/SC sessions are opened and closed per `collect()` call, preventing stale handle reuse and ensuring `Send + Sync` safety.
+- **Credential protection**: HSM PINs and passwords (`MIXRAND_PKCS11_PIN`, `MIXRAND_YUBIHSM_PASSWORD`) are read exclusively from environment variables, never stored in TOML config files or passed via CLI arguments (which would be visible in process listings).
+- **TPM resource manager**: Connections go through the kernel resource manager (`/dev/tpmrm0`), which serializes access and prevents interference with other TPM clients.
+
+## Additional Resources
+
+### Standards and Specifications
+
+| Standard | Relevance |
+|----------|-----------|
+| [NIST SP 800-90B](https://csrc.nist.gov/publications/detail/sp/800-90b/final) | Entropy source health testing (RCT, APT) |
+| [FIPS 140-2](https://csrc.nist.gov/publications/detail/fips/140/2/final) | Statistical test suite (monobit, poker, runs) |
+| [PKCS#11 v3.1 (OASIS)](https://docs.oasis-open.org/pkcs11/pkcs11-spec/v3.1/pkcs11-spec-v3.1.html) | HSM cryptographic token interface |
+| [TCG TPM 2.0 Specification](https://trustedcomputinggroup.org/resource/tpm-library-specification/) | TPM2_GetRandom command |
+| [ISO/IEC 7816-4](https://www.iso.org/standard/77180.html) | Smart card APDU commands (GET CHALLENGE) |
+| [PC/SC Specification](https://pcscworkgroup.com/specifications/) | Smart card reader interface |
+| [Intel SGX Developer Reference](https://www.intel.com/content/www/us/en/developer/tools/software-guard-extensions/overview.html) | SGX enclave development |
+| [RFC 8439](https://datatracker.ietf.org/doc/html/rfc8439) | ChaCha20-Poly1305 (ChaCha20 CSPRNG basis) |
+| [BLAKE2 Specification](https://www.blake2.net/) | BLAKE2b-256 entropy mixer |
+
+### Hardware Documentation
+
+| Device | Documentation |
+|--------|--------------|
+| YubiKey | [PIV Application Documentation](https://developers.yubico.com/PIV/) |
+| YubiHSM 2 | [YubiHSM 2 SDK Documentation](https://developers.yubico.com/YubiHSM2/) |
+| SoftHSM 2 | [OpenDNSSEC SoftHSM](https://www.opendnssec.org/softhsm/) (testing/development) |
 
 ## License
 

@@ -137,10 +137,289 @@ impl CpuRngConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HSM / secure-element configuration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Tpm2Config {
+    pub enabled: bool,
+    pub tcti: Option<String>,
+}
+
+impl Default for Tpm2Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tcti: None, // defaults to "device:/dev/tpmrm0" at runtime
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Pkcs11Config {
+    pub enabled: bool,
+    pub library_path: Option<String>,
+    pub slot_id: Option<u64>,
+    #[serde(skip_serializing)]
+    pub pin: Option<String>,
+}
+
+impl Default for Pkcs11Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            library_path: None,
+            slot_id: None,
+            pin: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PcscConfig {
+    pub enabled: bool,
+    pub reader: Option<String>,
+    pub max_le: u8,
+}
+
+impl Default for PcscConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reader: None,
+            max_le: 32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct YubiKeyConfig {
+    pub enabled: bool,
+    pub serial: Option<u32>,
+}
+
+impl Default for YubiKeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            serial: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct GnuPGConfig {
+    pub enabled: bool,
+    pub gpg_path: Option<String>,
+    pub quality_level: u8,
+}
+
+impl Default for GnuPGConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            gpg_path: None,
+            quality_level: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct YubiHsmConfig {
+    pub enabled: bool,
+    pub connector_url: Option<String>,
+    pub auth_key_id: u16,
+    #[serde(skip_serializing)]
+    pub password: Option<String>,
+}
+
+impl Default for YubiHsmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            connector_url: None,
+            auth_key_id: 1,
+            password: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SgxConfig {
+    pub enabled: bool,
+    pub enclave_path: Option<String>,
+}
+
+impl Default for SgxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enclave_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HsmConfig {
+    pub tpm2: Tpm2Config,
+    pub pkcs11: Pkcs11Config,
+    pub pcsc: PcscConfig,
+    pub yubikey: YubiKeyConfig,
+    pub gnupg: GnuPGConfig,
+    pub yubihsm: YubiHsmConfig,
+    pub sgx: SgxConfig,
+}
+
+impl HsmConfig {
+    /// Clamp fields to valid ranges. Returns a list of warnings for any fields that were clamped.
+    pub fn validate(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.gnupg.quality_level > 2 {
+            warnings.push(format!(
+                "gnupg quality_level clamped from {} to 2",
+                self.gnupg.quality_level
+            ));
+            self.gnupg.quality_level = 2;
+        }
+
+        if self.pcsc.max_le == 0 {
+            warnings.push("pcsc max_le clamped from 0 to 1".into());
+            self.pcsc.max_le = 1;
+        }
+
+        if self.yubihsm.auth_key_id == 0 {
+            warnings.push("yubihsm auth_key_id clamped from 0 to 1".into());
+            self.yubihsm.auth_key_id = 1;
+        }
+
+        warnings
+    }
+}
+
+/// Apply MIXRAND_* environment variable overrides to an HsmConfig.
+pub fn apply_hsm_env_overrides(cfg: &mut HsmConfig) {
+    fn env_bool(name: &str) -> Option<bool> {
+        std::env::var(name).ok().and_then(|v| match v.as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        })
+    }
+
+    fn env_str(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|s| !s.is_empty())
+    }
+
+    fn env_u8(name: &str) -> Option<u8> {
+        std::env::var(name).ok().and_then(|v| v.parse().ok())
+    }
+
+    fn env_u16(name: &str) -> Option<u16> {
+        std::env::var(name).ok().and_then(|v| v.parse().ok())
+    }
+
+    fn env_u32(name: &str) -> Option<u32> {
+        std::env::var(name).ok().and_then(|v| v.parse().ok())
+    }
+
+    fn env_u64(name: &str) -> Option<u64> {
+        std::env::var(name).ok().and_then(|v| v.parse().ok())
+    }
+
+    // TPM2
+    if let Some(v) = env_bool("MIXRAND_TPM2_ENABLED") {
+        cfg.tpm2.enabled = v;
+    }
+    if let Some(v) = env_str("MIXRAND_TPM2_TCTI") {
+        cfg.tpm2.tcti = Some(v);
+    }
+
+    // PKCS#11
+    if let Some(v) = env_bool("MIXRAND_PKCS11_ENABLED") {
+        cfg.pkcs11.enabled = v;
+    }
+    if let Some(v) = env_str("MIXRAND_PKCS11_LIBRARY_PATH") {
+        cfg.pkcs11.library_path = Some(v);
+    }
+    if let Some(v) = env_u64("MIXRAND_PKCS11_SLOT_ID") {
+        cfg.pkcs11.slot_id = Some(v);
+    }
+    if let Some(v) = env_str("MIXRAND_PKCS11_PIN") {
+        cfg.pkcs11.pin = Some(v);
+    }
+
+    // PC/SC
+    if let Some(v) = env_bool("MIXRAND_PCSC_ENABLED") {
+        cfg.pcsc.enabled = v;
+    }
+    if let Some(v) = env_str("MIXRAND_PCSC_READER") {
+        cfg.pcsc.reader = Some(v);
+    }
+    if let Some(v) = env_u8("MIXRAND_PCSC_MAX_LE") {
+        cfg.pcsc.max_le = v;
+    }
+
+    // YubiKey
+    if let Some(v) = env_bool("MIXRAND_YUBIKEY_ENABLED") {
+        cfg.yubikey.enabled = v;
+    }
+    if let Some(v) = env_u32("MIXRAND_YUBIKEY_SERIAL") {
+        cfg.yubikey.serial = Some(v);
+    }
+
+    // GnuPG
+    if let Some(v) = env_bool("MIXRAND_GNUPG_ENABLED") {
+        cfg.gnupg.enabled = v;
+    }
+    if let Some(v) = env_str("MIXRAND_GNUPG_GPG_PATH") {
+        cfg.gnupg.gpg_path = Some(v);
+    }
+    if let Some(v) = env_u8("MIXRAND_GNUPG_QUALITY_LEVEL") {
+        cfg.gnupg.quality_level = v;
+    }
+
+    // YubiHSM
+    if let Some(v) = env_bool("MIXRAND_YUBIHSM_ENABLED") {
+        cfg.yubihsm.enabled = v;
+    }
+    if let Some(v) = env_str("MIXRAND_YUBIHSM_CONNECTOR_URL") {
+        cfg.yubihsm.connector_url = Some(v);
+    }
+    if let Some(v) = env_u16("MIXRAND_YUBIHSM_AUTH_KEY_ID") {
+        cfg.yubihsm.auth_key_id = v;
+    }
+    if let Some(v) = env_str("MIXRAND_YUBIHSM_PASSWORD") {
+        cfg.yubihsm.password = Some(v);
+    }
+
+    // SGX
+    if let Some(v) = env_bool("MIXRAND_SGX_ENABLED") {
+        cfg.sgx.enabled = v;
+    }
+    if let Some(v) = env_str("MIXRAND_SGX_ENCLAVE_PATH") {
+        cfg.sgx.enclave_path = Some(v);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level config
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub cpu_rng: CpuRngConfig,
+    pub hsm: HsmConfig,
 }
 
 /// Load configuration from a TOML file.

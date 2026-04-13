@@ -39,6 +39,45 @@ pub enum CheckOutputFormat {
 }
 
 #[derive(Debug, Args)]
+pub struct HsmArgs {
+    /// Enable TPM2 entropy source
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_tpm2: Option<bool>,
+
+    /// Enable PKCS#11 entropy source
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_pkcs11: Option<bool>,
+
+    /// Enable PC/SC smart card entropy source
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_pcsc: Option<bool>,
+
+    /// Enable YubiKey entropy source
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_yubikey: Option<bool>,
+
+    /// Enable GnuPG entropy source
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_gnupg: Option<bool>,
+
+    /// Enable YubiHSM native entropy source
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_yubihsm: Option<bool>,
+
+    /// Enable Intel SGX entropy source
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_sgx: Option<bool>,
+
+    /// PKCS#11 library path (e.g. /usr/lib/softhsm/libsofthsm2.so)
+    #[arg(long)]
+    pub pkcs11_library: Option<String>,
+
+    /// TPM2 device path (default: /dev/tpmrm0)
+    #[arg(long)]
+    pub tpm2_device: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct CpuRngArgs {
     /// Enable RDSEED instruction
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
@@ -148,6 +187,9 @@ pub struct Cli {
     pub cpu_rng: CpuRngArgs,
 
     #[command(flatten)]
+    pub hsm: HsmArgs,
+
+    #[command(flatten)]
     pub log: LogArgs,
 
     #[command(subcommand)]
@@ -200,6 +242,9 @@ pub struct DaemonArgs {
     pub cpu_rng: CpuRngArgs,
 
     #[command(flatten)]
+    pub hsm: HsmArgs,
+
+    #[command(flatten)]
     pub log: LogArgs,
 }
 
@@ -237,6 +282,9 @@ pub struct CheckArgs {
     pub cpu_rng: CpuRngArgs,
 
     #[command(flatten)]
+    pub hsm: HsmArgs,
+
+    #[command(flatten)]
     pub log: LogArgs,
 }
 
@@ -255,6 +303,9 @@ pub struct ListSourcesArgs {
 
     #[command(flatten)]
     pub cpu_rng: CpuRngArgs,
+
+    #[command(flatten)]
+    pub hsm: HsmArgs,
 
     #[command(flatten)]
     pub log: LogArgs,

@@ -17,23 +17,29 @@ use std::process;
 
 use clap::Parser;
 
-use cli::{Cli, Command, CpuRngArgs};
-use config::CpuRngConfig;
+use cli::{Cli, Command, CpuRngArgs, HsmArgs};
+use config::Config;
 
-/// Build a CpuRngConfig by layering: defaults -> TOML file -> env vars -> CLI overrides.
-fn build_cpu_rng_config(config_file: Option<&Path>, cpu_rng_args: &CpuRngArgs) -> CpuRngConfig {
-    let mut cfg = match config::load_config(config_file) {
-        Ok(c) => c.cpu_rng,
+/// Build a full Config by layering: defaults -> TOML file -> env vars -> CLI overrides.
+fn build_config(
+    config_file: Option<&Path>,
+    cpu_rng_args: &CpuRngArgs,
+    hsm_args: &HsmArgs,
+) -> Config {
+    let mut full_cfg = match config::load_config(config_file) {
+        Ok(c) => c,
         Err(e) => {
             log::warn!("{}", e);
-            CpuRngConfig::default()
+            Config::default()
         }
     };
 
     // Apply environment variable overrides
-    config::apply_env_overrides(&mut cfg);
+    config::apply_env_overrides(&mut full_cfg.cpu_rng);
+    config::apply_hsm_env_overrides(&mut full_cfg.hsm);
 
-    // Apply CLI overrides (only if explicitly set)
+    // Apply CPU RNG CLI overrides (only if explicitly set)
+    let cfg = &mut full_cfg.cpu_rng;
     if let Some(v) = cpu_rng_args.enable_rdseed {
         cfg.enable_rdseed = v;
     }
@@ -77,11 +83,45 @@ fn build_cpu_rng_config(config_file: Option<&Path>, cpu_rng_args: &CpuRngArgs) -
         cfg.mixer_mode = v;
     }
 
-    let warnings = cfg.validate();
-    for w in warnings {
+    // Apply HSM CLI overrides (only if explicitly set)
+    let hsm = &mut full_cfg.hsm;
+    if let Some(v) = hsm_args.enable_tpm2 {
+        hsm.tpm2.enabled = v;
+    }
+    if let Some(v) = hsm_args.enable_pkcs11 {
+        hsm.pkcs11.enabled = v;
+    }
+    if let Some(v) = hsm_args.enable_pcsc {
+        hsm.pcsc.enabled = v;
+    }
+    if let Some(v) = hsm_args.enable_yubikey {
+        hsm.yubikey.enabled = v;
+    }
+    if let Some(v) = hsm_args.enable_gnupg {
+        hsm.gnupg.enabled = v;
+    }
+    if let Some(v) = hsm_args.enable_yubihsm {
+        hsm.yubihsm.enabled = v;
+    }
+    if let Some(v) = hsm_args.enable_sgx {
+        hsm.sgx.enabled = v;
+    }
+    if let Some(ref v) = hsm_args.pkcs11_library {
+        hsm.pkcs11.library_path = Some(v.clone());
+    }
+    if let Some(ref v) = hsm_args.tpm2_device {
+        hsm.tpm2.tcti = Some(format!("device:{}", v));
+    }
+
+    let cpu_warnings = full_cfg.cpu_rng.validate();
+    for w in cpu_warnings {
         log::warn!("config: {}", w);
     }
-    cfg
+    let hsm_warnings = full_cfg.hsm.validate();
+    for w in hsm_warnings {
+        log::warn!("config: {}", w);
+    }
+    full_cfg
 }
 
 /// Maximum byte count per generation (100 MiB).
@@ -90,7 +130,7 @@ const MAX_BYTES: usize = 100 * 1024 * 1024;
 /// Maximum iteration count for --count flag.
 const MAX_COUNT: usize = 10_000;
 
-fn run_generate(cli: &Cli, cpu_config: &CpuRngConfig) {
+fn run_generate(cli: &Cli, config: &Config) {
     if cli.bytes == 0 {
         log::error!("byte count must be greater than 0");
         process::exit(1);
@@ -110,7 +150,7 @@ fn run_generate(cli: &Cli, cpu_config: &CpuRngConfig) {
     }
 
     for _ in 0..iterations {
-        match entropy::generate(cli.bytes, cpu_config) {
+        match entropy::generate(cli.bytes, config) {
             Ok(result) => {
                 log::info!("entropy source: {}", result.source);
                 let mut bytes = result.bytes;
@@ -130,9 +170,9 @@ fn run_generate(cli: &Cli, cpu_config: &CpuRngConfig) {
     }
 }
 
-fn run_list_sources(cpu_config: &CpuRngConfig) {
+fn run_list_sources(config: &Config) {
     const PROBE_BYTES: usize = 32;
-    let sources = entropy::build_check_sources(cpu_config);
+    let sources = entropy::build_check_sources(config);
     println!("{:<12} {:<10} {:<10} Description", "Name", "Status", "Type");
     println!("{:-<12} {:-<10} {:-<10} {:-<50}", "", "", "", "");
     for source in &sources {
@@ -174,41 +214,41 @@ fn main() {
                 log_args.log_level = Some(logging::LogLevel::Info);
             }
             logging::init(&log_args, true);
-            let cpu_config =
-                build_cpu_rng_config(args.config_file.as_deref(), &args.cpu_rng);
-            if let Err(e) = daemon::run(args, &cpu_config) {
+            let config =
+                build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
+            if let Err(e) = daemon::run(args, &config) {
                 log::error!("{}", e);
                 process::exit(1);
             }
         }
         Some(Command::Check(args)) => {
             logging::init(&args.log, false);
-            let cpu_config =
-                build_cpu_rng_config(args.config_file.as_deref(), &args.cpu_rng);
-            if let Err(e) = check::run(args, &cpu_config) {
+            let config =
+                build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
+            if let Err(e) = check::run(args, &config) {
                 log::error!("{}", e);
                 process::exit(1);
             }
         }
         Some(Command::ListSources(args)) => {
             logging::init(&args.log, false);
-            let cpu_config =
-                build_cpu_rng_config(args.config_file.as_deref(), &args.cpu_rng);
-            run_list_sources(&cpu_config);
+            let config =
+                build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
+            run_list_sources(&config);
         }
         None => {
             let mut log_args = cli.log.clone();
             log_args.log_level = effective_log_level(&cli.log, cli.verbose, cli.quiet);
             logging::init(&log_args, false);
-            let cpu_config =
-                build_cpu_rng_config(cli.config_file.as_deref(), &cli.cpu_rng);
+            let config =
+                build_config(cli.config_file.as_deref(), &cli.cpu_rng, &cli.hsm);
 
             if cli.show_config {
-                println!("{}", toml::to_string_pretty(&cpu_config).unwrap_or_else(|_| format!("{:?}", cpu_config)));
+                println!("{}", toml::to_string_pretty(&config.cpu_rng).unwrap_or_else(|_| format!("{:?}", config.cpu_rng)));
                 return;
             }
 
-            run_generate(&cli, &cpu_config);
+            run_generate(&cli, &config);
         }
     }
 }
@@ -216,6 +256,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::CpuRngConfig;
 
     fn default_log_args() -> logging::LogArgs {
         logging::LogArgs {
@@ -242,6 +283,20 @@ mod tests {
             fallback_mix_bytes: None,
             oversample: None,
             mixer_mode: None,
+        }
+    }
+
+    fn default_hsm_args() -> HsmArgs {
+        HsmArgs {
+            enable_tpm2: None,
+            enable_pkcs11: None,
+            enable_pcsc: None,
+            enable_yubikey: None,
+            enable_gnupg: None,
+            enable_yubihsm: None,
+            enable_sgx: None,
+            pkcs11_library: None,
+            tpm2_device: None,
         }
     }
 
@@ -280,32 +335,46 @@ mod tests {
     }
 
     #[test]
-    fn test_build_cpu_rng_config_defaults_no_file() {
+    fn test_build_config_defaults_no_file() {
         let args = default_cpu_rng_args();
-        let cfg = build_cpu_rng_config(None, &args);
+        let hsm = default_hsm_args();
+        let cfg = build_config(None, &args, &hsm);
         let default = CpuRngConfig::default();
-        assert_eq!(cfg.enable_rdseed, default.enable_rdseed);
-        assert_eq!(cfg.rdrand_retries, default.rdrand_retries);
-        assert_eq!(cfg.oversample, default.oversample);
+        assert_eq!(cfg.cpu_rng.enable_rdseed, default.enable_rdseed);
+        assert_eq!(cfg.cpu_rng.rdrand_retries, default.rdrand_retries);
+        assert_eq!(cfg.cpu_rng.oversample, default.oversample);
     }
 
     #[test]
-    fn test_build_cpu_rng_config_cli_overrides() {
+    fn test_build_config_cli_overrides() {
         let mut args = default_cpu_rng_args();
         args.enable_rdseed = Some(false);
         args.rdrand_retries = Some(50);
-        let cfg = build_cpu_rng_config(None, &args);
-        assert!(!cfg.enable_rdseed);
-        assert_eq!(cfg.rdrand_retries, 50);
+        let hsm = default_hsm_args();
+        let cfg = build_config(None, &args, &hsm);
+        assert!(!cfg.cpu_rng.enable_rdseed);
+        assert_eq!(cfg.cpu_rng.rdrand_retries, 50);
         // Unset fields remain default
-        assert!(cfg.enable_rdrand);
+        assert!(cfg.cpu_rng.enable_rdrand);
     }
 
     #[test]
-    fn test_build_cpu_rng_config_validates() {
+    fn test_build_config_validates() {
         let mut args = default_cpu_rng_args();
         args.rdrand_retries = Some(200);
-        let cfg = build_cpu_rng_config(None, &args);
-        assert_eq!(cfg.rdrand_retries, 100); // clamped from 200
+        let hsm = default_hsm_args();
+        let cfg = build_config(None, &args, &hsm);
+        assert_eq!(cfg.cpu_rng.rdrand_retries, 100); // clamped from 200
+    }
+
+    #[test]
+    fn test_build_config_hsm_overrides() {
+        let args = default_cpu_rng_args();
+        let mut hsm = default_hsm_args();
+        hsm.enable_tpm2 = Some(false);
+        hsm.pkcs11_library = Some("/usr/lib/test.so".into());
+        let cfg = build_config(None, &args, &hsm);
+        assert!(!cfg.hsm.tpm2.enabled);
+        assert_eq!(cfg.hsm.pkcs11.library_path.as_deref(), Some("/usr/lib/test.so"));
     }
 }

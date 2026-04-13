@@ -1,13 +1,28 @@
 pub mod cpurng;
 pub mod fallback;
 pub mod getrandom;
+#[cfg(feature = "gnupg")]
+pub mod gnupg;
 pub mod haveged;
 pub mod hwrng;
 pub mod jitter;
+#[cfg(feature = "pcsc")]
+pub mod pcsc;
+#[cfg(feature = "pkcs11")]
+pub mod pkcs11;
 pub mod procfs;
+#[cfg(feature = "sgx")]
+pub mod sgx;
+#[cfg(feature = "tpm2")]
+pub mod tpm2;
+#[cfg(feature = "yubikey")]
+pub mod yubikey;
+#[cfg(feature = "yubihsm-native")]
+pub mod yubihsm;
 
 use std::path::Path;
 
+use crate::config::Config;
 use crate::config::CpuRngConfig;
 use crate::error::Error;
 use crate::health::HealthTester;
@@ -379,30 +394,84 @@ impl EntropySource for FallbackSource {
 // Source builders
 // ---------------------------------------------------------------------------
 
+/// Add HSM/secure-element sources based on feature flags and configuration.
+#[allow(unused_variables)]
+fn add_hsm_sources(sources: &mut Vec<Box<dyn EntropySource>>, config: &Config) {
+    #[cfg(feature = "sgx")]
+    if config.hsm.sgx.enabled {
+        sources.push(Box::new(sgx::SgxSource::new(&config.hsm.sgx)));
+    }
+
+    #[cfg(feature = "tpm2")]
+    if config.hsm.tpm2.enabled {
+        sources.push(Box::new(tpm2::Tpm2Source::new(&config.hsm.tpm2)));
+    }
+
+    #[cfg(feature = "pkcs11")]
+    if config.hsm.pkcs11.enabled && config.hsm.pkcs11.library_path.is_some() {
+        sources.push(Box::new(pkcs11::Pkcs11Source::new(&config.hsm.pkcs11)));
+    }
+
+    #[cfg(feature = "yubihsm-native")]
+    if config.hsm.yubihsm.enabled {
+        sources.push(Box::new(yubihsm::YubiHsmSource::new(&config.hsm.yubihsm)));
+    }
+
+    #[cfg(feature = "yubikey")]
+    if config.hsm.yubikey.enabled {
+        sources.push(Box::new(yubikey::YubiKeySource::new(&config.hsm.yubikey)));
+    }
+
+    #[cfg(feature = "pcsc")]
+    if config.hsm.pcsc.enabled {
+        sources.push(Box::new(pcsc::PcscSource::new(&config.hsm.pcsc)));
+    }
+
+    #[cfg(feature = "gnupg")]
+    if config.hsm.gnupg.enabled {
+        sources.push(Box::new(gnupg::GnuPGSource::new(&config.hsm.gnupg)));
+    }
+
+    // Suppress unused variable warning when no HSM features are enabled
+    let _ = config;
+}
+
 /// Build the sources used by `generate()` (main entropy cascade).
-pub fn build_generate_sources(config: &CpuRngConfig) -> Vec<Box<dyn EntropySource>> {
-    vec![
+pub fn build_generate_sources(config: &Config) -> Vec<Box<dyn EntropySource>> {
+    let mut sources: Vec<Box<dyn EntropySource>> = vec![
         Box::new(HwrngSource),
-        Box::new(CpuRngStandaloneSource::new(config)),
-        Box::new(HavegedSource),
-        Box::new(FallbackSource::new(config)),
-    ]
+    ];
+
+    add_hsm_sources(&mut sources, config);
+
+    sources.push(Box::new(CpuRngStandaloneSource::new(&config.cpu_rng)));
+    sources.push(Box::new(HavegedSource));
+    sources.push(Box::new(FallbackSource::new(&config.cpu_rng)));
+
+    sources.sort_by_key(|s| s.priority());
+    sources
 }
 
 /// Build all granular sources for statistical testing in `check` mode.
-pub fn build_check_sources(config: &CpuRngConfig) -> Vec<Box<dyn EntropySource>> {
-    vec![
+pub fn build_check_sources(config: &Config) -> Vec<Box<dyn EntropySource>> {
+    let mut sources: Vec<Box<dyn EntropySource>> = vec![
         Box::new(HwrngSource),
-        Box::new(RndrrsSource::new(config)),
-        Box::new(RndrSource::new(config)),
-        Box::new(RdseedSource::new(config)),
-        Box::new(RdrandSource::new(config)),
-        Box::new(XstoreSource::new(config)),
+        Box::new(RndrrsSource::new(&config.cpu_rng)),
+        Box::new(RndrSource::new(&config.cpu_rng)),
+        Box::new(RdseedSource::new(&config.cpu_rng)),
+        Box::new(RdrandSource::new(&config.cpu_rng)),
+        Box::new(XstoreSource::new(&config.cpu_rng)),
         Box::new(HavegedSource),
         Box::new(GetrandomSource),
         Box::new(UrandomSource),
-        Box::new(FallbackSource::new(config)),
-    ]
+    ];
+
+    add_hsm_sources(&mut sources, config);
+
+    sources.push(Box::new(FallbackSource::new(&config.cpu_rng)));
+
+    sources.sort_by_key(|s| s.priority());
+    sources
 }
 
 /// Run a quick health check on entropy bytes using NIST SP 800-90B tests.
@@ -423,7 +492,7 @@ fn health_check(bytes: &[u8]) -> bool {
 
 /// Attempts entropy sources in priority order, running a health check on each.
 /// Sources that fail collection or health testing are skipped.
-pub fn generate(count: usize, config: &CpuRngConfig) -> Result<EntropyResult, Error> {
+pub fn generate(count: usize, config: &Config) -> Result<EntropyResult, Error> {
     let sources = build_generate_sources(config);
 
     let mut tried = Vec::new();
@@ -463,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_generate_produces_bytes() {
-        let config = CpuRngConfig::default();
+        let config = Config::default();
         let result = generate(32, &config).unwrap();
         assert_eq!(result.bytes.len(), 32);
         assert!(!result.source.is_empty());
@@ -471,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_generate_different_sizes() {
-        let config = CpuRngConfig::default();
+        let config = Config::default();
         for &size in &[1, 16, 64, 256] {
             let result = generate(size, &config).unwrap();
             assert_eq!(result.bytes.len(), size);
@@ -479,22 +548,24 @@ mod tests {
     }
 
     #[test]
-    fn test_build_generate_sources_order() {
-        let config = CpuRngConfig::default();
+    fn test_build_generate_sources_has_core() {
+        let config = Config::default();
         let sources = build_generate_sources(&config);
-        assert_eq!(sources.len(), 4);
-        assert_eq!(sources[0].name(), "hwrng");
-        assert_eq!(sources[1].name(), "cpurng");
-        assert_eq!(sources[2].name(), "haveged");
-        assert_eq!(sources[3].name(), "fallback");
+        // At minimum: hwrng, cpurng, haveged, fallback
+        assert!(sources.len() >= 4);
+        let names: Vec<&str> = sources.iter().map(|s| s.name()).collect();
+        assert!(names.contains(&"hwrng"));
+        assert!(names.contains(&"cpurng"));
+        assert!(names.contains(&"haveged"));
+        assert!(names.contains(&"fallback"));
     }
 
     #[test]
     fn test_build_check_sources() {
-        let config = CpuRngConfig::default();
+        let config = Config::default();
         let sources = build_check_sources(&config);
-        assert_eq!(sources.len(), 10);
-        // Verify names match expected
+        // At minimum: 10 core sources
+        assert!(sources.len() >= 10);
         let names: Vec<&str> = sources.iter().map(|s| s.name()).collect();
         assert!(names.contains(&"hwrng"));
         assert!(names.contains(&"fallback"));
@@ -503,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_source_priorities_ascending() {
-        let config = CpuRngConfig::default();
+        let config = Config::default();
         let sources = build_generate_sources(&config);
         for i in 1..sources.len() {
             assert!(
@@ -561,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_generate_large_request() {
-        let config = CpuRngConfig::default();
+        let config = Config::default();
         let result = generate(4096, &config).unwrap();
         assert_eq!(result.bytes.len(), 4096);
     }

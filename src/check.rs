@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::cli::{CheckArgs, CheckOutputFormat};
-use crate::config::CpuRngConfig;
+use crate::config::Config;
 use crate::entropy::{self, EntropySource};
 use crate::error::Error;
 use crate::stats;
@@ -519,7 +519,7 @@ fn output_csv(
 /// Maximum sample size for statistical tests (10 MiB).
 const MAX_SAMPLE_SIZE: usize = 10 * 1024 * 1024;
 
-pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
+pub fn run(args: &CheckArgs, config: &Config) -> Result<(), Error> {
     if args.sample_size == 0 {
         return Err(Error::InvalidArgs("sample-size must be greater than 0".into()));
     }
@@ -547,7 +547,7 @@ pub fn run(args: &CheckArgs, cpu_config: &CpuRngConfig) -> Result<(), Error> {
     if !quiet {
         eprintln!("Probing entropy sources...");
     }
-    let all_sources = entropy::build_check_sources(cpu_config);
+    let all_sources = entropy::build_check_sources(config);
     let sources = probe_sources(all_sources, quiet);
 
     // Filter by user-requested sources

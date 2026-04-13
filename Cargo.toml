@@ -3,6 +3,18 @@ name = "mixrand"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+pkcs11 = ["dep:cryptoki"]
+tpm2 = ["dep:tss-esapi"]
+pcsc = ["dep:pcsc"]
+yubikey = ["pcsc"]
+gnupg = []
+yubihsm-native = ["dep:yubihsm"]
+sgx = []
+hsm = ["pkcs11", "tpm2", "pcsc", "yubikey", "gnupg"]
+all-sources = ["hsm", "yubihsm-native", "sgx"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -16,3 +28,9 @@ serde_json = "1"
 toml = "0.8"
 log = "0.4"
 syslog = "7"
+
+# Optional HSM/secure element dependencies
+cryptoki = { version = "0.10", optional = true }
+tss-esapi = { version = "7", optional = true }
+pcsc = { version = "2", optional = true }
+yubihsm = { version = "0.42", features = ["http"], optional = true }
