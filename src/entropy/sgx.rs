@@ -61,9 +61,7 @@ impl EntropySource for SgxSource {
 
     fn collect(&self, count: usize) -> Result<Vec<u8>, Error> {
         if !self.sgx_device_exists() {
-            return Err(Error::NoEntropy(
-                "SGX: no SGX device node found".into(),
-            ));
+            return Err(Error::NoEntropy("SGX: no SGX device node found".into()));
         }
 
         // SGX enclaves use the same hardware RNG (RDRAND/RDSEED) that the CPU

@@ -14,6 +14,19 @@ Operating systems provide `/dev/urandom` and `getrandom()`, which are sufficient
 
 Mixrand never replaces your OS entropy source — it layers additional sources on top and mixes them cryptographically so that the output is at least as strong as the strongest individual input.
 
+**MSRV:** Rust 1.74+.
+
+**Documentation map:**
+
+- [`docs/entropy-sources.md`](docs/entropy-sources.md) — per-source permissions, failure modes, priority.
+- [`docs/hsm/`](docs/hsm/) — step-by-step setup for TPM2, PKCS#11, YubiKey, YubiHSM, PC/SC, GnuPG, SGX.
+- [`docs/deployment.md`](docs/deployment.md) — production systemd install + hardening.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — common failure modes.
+- [`docs/config.example.toml`](docs/config.example.toml) — annotated config template.
+- [`docs/mixrand.1`](docs/mixrand.1) — manpage.
+- [`SECURITY.md`](SECURITY.md) — threat model + disclosure policy.
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes incl. KAT/domain-tag rotations.
+
 ## Quick Start
 
 ```bash
@@ -41,8 +54,14 @@ mixrand list-sources
 # Run FIPS 140-2 statistical tests for 30 seconds
 mixrand check -d 30s
 
+# Microbenchmark per-source throughput
+mixrand bench --duration 3s --sources rdrand,rdseed,jitter
+
 # Feed the Linux kernel entropy pool (requires root)
 sudo mixrand daemon
+
+# Print build provenance (git sha, build timestamp, rustc, features)
+mixrand --version --verbose
 ```
 
 ### HSM Quick Start
@@ -83,6 +102,23 @@ mixrand check -d 1m --sources=tpm2,pkcs11,gnupg
 - **Structured logging**: RFC 3339 timestamps, text or JSON format, stderr + file + syslog outputs
 - **Flexible configuration**: Four-layer merge (defaults -> TOML -> environment variables -> CLI flags)
 - **Input safety**: Upper bounds on byte count (100 MiB), iteration count (10,000), and sample size (10 MiB) to prevent accidental resource exhaustion
+
+## Output formats
+
+Every invocation of `mixrand` emits bytes in one of nine formats via
+`-f <format>`. For a fixed 16-byte input `00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f` the outputs are:
+
+| Format | Example output (16-byte input) | Use |
+|---|---|---|
+| `hex` (default) | `000102030405060708090a0b0c0d0e0f` | copy-paste, logs |
+| `hex-upper` | `000102030405060708090A0B0C0D0E0F` | contexts that require uppercase |
+| `raw` | binary `00 01 ... 0f` + no trailing newline | piping into `dd`, `openssl`, etc. |
+| `base64` | `AAECAwQFBgcICQoLDA0ODw==` | ASCII-armored keys, JSON fields |
+| `base64url` | `AAECAwQFBgcICQoLDA0ODw` | URL-safe, no padding |
+| `uuencode` | `begin 644 data\nP` + payload + ``\``\nend\n`` | legacy tooling, email |
+| `text` | 16 printable ASCII chars from a 94-char alphabet (`!..~`) | passwords |
+| `octal` | `000 001 002 003 004 005 006 007 010 011 012 013 014 015 016 017` | debugging, C arrays |
+| `binary` | `00000000 00000001 ... 00001111` | bit-level debugging |
 
 ## Architecture
 
@@ -272,6 +308,28 @@ flowchart TD
     Loop -- Yes --> Cleanup["Remove PID file<br/>sd_notify(STOPPING=1)"] --> Shutdown([Graceful Shutdown])
 ```
 
+#### Signals
+
+- `SIGTERM` / `SIGINT` — graceful shutdown; PID file removed.
+- `SIGHUP` — reload `/etc/mixrand.toml` in place. **Does not** reopen
+  `/dev/random`, re-probe sources, or re-run the startup self-test —
+  restart the service for those.
+
+#### Startup self-test
+
+The daemon probes every built source and runs RCT+APT on a 256-byte
+sample before sending `READY=1` to systemd. If every source fails,
+the daemon exits non-zero instead of entering the main loop, so a
+misconfigured host won't silently degrade to urandom under
+`Type=notify`. Pass `--no-self-test` to bypass (debugging only).
+
+#### Deployment
+
+See [`deploy/systemd/mixrand.service`](deploy/systemd/mixrand.service)
+and [`docs/deployment.md`](docs/deployment.md) for a hardened
+systemd unit, tmpfiles.d entry, capability-set rationale, and a
+production checklist.
+
 ### Statistical Validation (`mixrand check`)
 
 Probes all available entropy sources and runs continuous statistical tests against each one. Results are available as text, JSON, or CSV for CI/CD integration.
@@ -335,7 +393,7 @@ flowchart LR
     D --> T --> E --> C --> Final(["Final Config<br/><i>validated and clamped</i>"])
 ```
 
-CLI fields use `Option<T>` so "not set" is distinguishable from "set to default value". Only explicitly-set fields override earlier layers. Out-of-range values are clamped with a logged warning.
+CLI fields use `Option<T>` so "not set" is distinguishable from "set to default value". Only explicitly-set fields override earlier layers. Out-of-range values are **silently clamped** to the documented min/max with a WARN-level log — always check `mixrand --log-level warn --show-config` after changing tunables.
 
 ### Security Model
 
@@ -498,15 +556,17 @@ flowchart LR
 
 #### Per-Source Details
 
-| Source | Feature Flag | System Library | Prerequisites |
-|--------|-------------|----------------|---------------|
-| **SGX** | `sgx` | `libsgx_urts` (runtime) | Intel SGX CPU + driver (`/dev/sgx_enclave`) |
-| **TPM2** | `tpm2` | `libtss2-dev` (compile) | TPM 2.0 chip + `/dev/tpmrm0` |
-| **PKCS#11** | `pkcs11` | None (runtime dlopen) | Vendor PKCS#11 `.so` library |
-| **YubiHSM** | `yubihsm-native` | None (pure Rust) | YubiHSM 2 + `yubihsm-connector` |
-| **YubiKey** | `yubikey` | `libpcsclite-dev` (compile) | YubiKey + USB reader + `pcscd` |
-| **PC/SC** | `pcsc` | `libpcsclite-dev` (compile) | Smart card + reader + `pcscd` |
-| **GnuPG** | `gnupg` | None | `gpg` binary on `$PATH` |
+| Source | Feature Flag | System Library | Prerequisites | Setup guide |
+|--------|-------------|----------------|---------------|---|
+| **SGX** ⚠️ | `sgx` | `libsgx_urts` (runtime) | Intel SGX CPU + driver (`/dev/sgx_enclave`) | [docs/hsm/sgx.md](docs/hsm/sgx.md) |
+| **TPM2** | `tpm2` | `libtss2-dev` (compile) | TPM 2.0 chip + `/dev/tpmrm0` | [docs/hsm/tpm2.md](docs/hsm/tpm2.md) |
+| **PKCS#11** | `pkcs11` | None (runtime dlopen) | Vendor PKCS#11 `.so` library | [docs/hsm/pkcs11.md](docs/hsm/pkcs11.md) |
+| **YubiHSM** | `yubihsm-native` | None (pure Rust) | YubiHSM 2 + `yubihsm-connector` | [docs/hsm/yubihsm.md](docs/hsm/yubihsm.md) |
+| **YubiKey** | `yubikey` | `libpcsclite-dev` (compile) | YubiKey + USB reader + `pcscd` | [docs/hsm/yubikey.md](docs/hsm/yubikey.md) |
+| **PC/SC** | `pcsc` | `libpcsclite-dev` (compile) | Smart card + reader + `pcscd` | [docs/hsm/pcsc.md](docs/hsm/pcsc.md) |
+| **GnuPG** | `gnupg` | None | `gpg` binary on `$PATH` | [docs/hsm/gnupg.md](docs/hsm/gnupg.md) |
+
+> ⚠️ **SGX caveat**: The current `sgx` feature verifies SGX hardware presence and then reads via RDRAND from the untrusted runtime — it is **not** a true enclave-sealed source today. See [`docs/hsm/sgx.md`](docs/hsm/sgx.md) for the full limitation write-up and roadmap.
 
 **PKCS#11 compatible devices** (use the `pkcs11` source with the appropriate library path):
 

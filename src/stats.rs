@@ -294,7 +294,9 @@ pub fn autocorrelation(data: &[u8], lag: usize) -> f64 {
 
 /// Multi-lag autocorrelation for lags 1..=max_lag.
 pub fn multi_lag_autocorrelation(data: &[u8], max_lag: usize) -> Vec<f64> {
-    (1..=max_lag).map(|lag| autocorrelation(data, lag)).collect()
+    (1..=max_lag)
+        .map(|lag| autocorrelation(data, lag))
+        .collect()
 }
 
 /// Approximate Entropy (ApEn) for block size m.
@@ -491,6 +493,23 @@ mod tests {
         data
     }
 
+    /// Build a 2500-byte array with exactly `ones_count` set bits.
+    /// Bits are packed into the low-index bytes first.
+    fn make_data_with_ones(ones_count: usize) -> [u8; 2500] {
+        assert!(ones_count <= 20_000, "sample is 20000 bits max");
+        let mut data = [0u8; 2500];
+        let full_bytes = ones_count / 8;
+        for i in 0..full_bytes {
+            data[i] = 0xFF;
+        }
+        let remainder = ones_count % 8;
+        if remainder > 0 {
+            // Set the top `remainder` bits of the next byte (MSB-first).
+            data[full_bytes] = 0xFFu8 << (8 - remainder);
+        }
+        data
+    }
+
     // --- FIPS Monobit ---
 
     #[test]
@@ -505,6 +524,37 @@ mod tests {
         let result = fips_monobit(&all_aa());
         assert!(result.passed);
         assert_eq!(result.value, 10000.0);
+    }
+
+    // Boundary pinning: FIPS 140-2 monobit spec requires 9725 < count < 10275
+    // (strict inequality). Pin both edges of the pass window.
+
+    #[test]
+    fn test_monobit_boundary_low_9725_fails() {
+        let data = make_data_with_ones(9725);
+        let r = fips_monobit(&data);
+        assert!(!r.passed, "count 9725 should fail (strict '>')");
+    }
+
+    #[test]
+    fn test_monobit_boundary_low_9726_passes() {
+        let data = make_data_with_ones(9726);
+        let r = fips_monobit(&data);
+        assert!(r.passed, "count 9726 should pass");
+    }
+
+    #[test]
+    fn test_monobit_boundary_high_10274_passes() {
+        let data = make_data_with_ones(10274);
+        let r = fips_monobit(&data);
+        assert!(r.passed, "count 10274 should pass");
+    }
+
+    #[test]
+    fn test_monobit_boundary_high_10275_fails() {
+        let data = make_data_with_ones(10275);
+        let r = fips_monobit(&data);
+        assert!(!r.passed, "count 10275 should fail (strict '<')");
     }
 
     // --- FIPS Poker ---
@@ -549,6 +599,88 @@ mod tests {
         let result = fips_long_runs(&all_aa());
         assert!(result.passed);
         assert_eq!(result.value, 1.0);
+    }
+
+    /// Build a 2500-byte array whose longest run of 1-bits is exactly
+    /// `run_len` bits. Baseline is the alternating 0/1 bit pattern so the
+    /// only "long" run comes from the engineered splice.
+    fn make_long_run_data(run_len: usize) -> [u8; 2500] {
+        assert!(run_len >= 1 && run_len <= 200);
+        // Allocate a bit-level scratch of 20000 bits.
+        let mut bits = [0u8; 20_000];
+        for i in 0..20_000 {
+            bits[i] = (i % 2) as u8; // 0, 1, 0, 1, ...
+        }
+        // Inject the run at bit index 10000 (guaranteed to start on a 0 in
+        // the alternating pattern). Force the bits immediately before and
+        // after the run to 0 so the run is exactly `run_len`.
+        let pos = 10_000;
+        bits[pos - 1] = 0;
+        for i in 0..run_len {
+            bits[pos + i] = 1;
+        }
+        bits[pos + run_len] = 0;
+
+        // Pack MSB-first into bytes.
+        let mut data = [0u8; 2500];
+        for i in 0..20_000 {
+            if bits[i] == 1 {
+                let byte_idx = i / 8;
+                let bit_pos = 7 - (i % 8);
+                data[byte_idx] |= 1u8 << bit_pos;
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_long_runs_boundary_length_25_passes() {
+        let data = make_long_run_data(25);
+        let r = fips_long_runs(&data);
+        assert!(r.passed, "run length 25 should pass (boundary)");
+        assert_eq!(r.value, 25.0);
+    }
+
+    #[test]
+    fn test_long_runs_boundary_length_26_fails() {
+        let data = make_long_run_data(26);
+        let r = fips_long_runs(&data);
+        assert!(!r.passed, "run length 26 must fail");
+        assert_eq!(r.value, 26.0);
+    }
+
+    // Composed suite: any one of four failing tests must reject the sample.
+
+    #[test]
+    fn test_fips_suite_rejects_if_any_one_fails() {
+        // all-zeros definitely fails monobit + poker + runs + long_runs.
+        // Inject in particular: a sample that only violates long_runs.
+        // We reuse the chacha sample and splice a very long engineered
+        // run into it.
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::{RngCore, SeedableRng};
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let mut data = [0u8; 2500];
+        rng.fill_bytes(&mut data);
+        // Confirm baseline passes:
+        let baseline = fips_suite(&data);
+        assert!(baseline.all_passed(), "baseline chacha should pass all");
+
+        // Now engineer a run of 30 1-bits starting at byte 1000 to violate
+        // only long_runs. The engineered region is small vs 20000 bits so
+        // monobit/poker/runs remain close to nominal.
+        for b in 999..1005 {
+            data[b] = 0xFF;
+        }
+        let result = fips_suite(&data);
+        assert!(
+            !result.long_runs.passed || !result.all_passed() || !result.monobit.passed,
+            "engineered run should cause at least one sub-test to fail"
+        );
+        assert!(
+            !result.all_passed(),
+            "suite must reject when any subtest fails"
+        );
     }
 
     // --- Shannon Entropy ---
@@ -658,7 +790,11 @@ mod tests {
         // All-zero bytes produce a constant bit stream (all 0-bits)
         let data = vec![0u8; 1000];
         let apen = approximate_entropy(&data, 2);
-        assert!(apen.abs() < 0.01, "expected ~0 for constant bit data, got {}", apen);
+        assert!(
+            apen.abs() < 0.01,
+            "expected ~0 for constant bit data, got {}",
+            apen
+        );
     }
 
     #[test]
@@ -713,7 +849,11 @@ mod tests {
         let data = vec![42u8; 1000];
         let lz = lempel_ziv_complexity(&data);
         // Constant data: only ~log(n) phrases, much less than expected
-        assert!(lz < 0.1, "expected low LZ ratio for constant data, got {}", lz);
+        assert!(
+            lz < 0.1,
+            "expected low LZ ratio for constant data, got {}",
+            lz
+        );
     }
 
     #[test]
@@ -734,7 +874,10 @@ mod tests {
         assert!(be2 > 5.0, "expected block entropy > 5.0, got {}", be2);
         assert!(be4 > 2.0, "expected block entropy > 2.0, got {}", be4);
         // Both should be higher than constant data
-        assert!(be2 > be4, "2-byte blocks should have higher per-byte entropy than 4-byte");
+        assert!(
+            be2 > be4,
+            "2-byte blocks should have higher per-byte entropy than 4-byte"
+        );
     }
 
     #[test]

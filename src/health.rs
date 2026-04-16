@@ -1,16 +1,28 @@
+//! Continuous health tests per NIST SP 800-90B.
+//!
+//! Two online tests run on every 64-bit sample fed to the tester:
+//! - **Repetition Count Test (RCT)** — detects stuck outputs (same value
+//!   repeated beyond a cutoff).
+//! - **Adaptive Proportion Test (APT)** — detects bias toward one value
+//!   across a sliding 1024-sample window.
+//!
+//! Cutoffs are derived from the caller's estimated min-entropy per sample.
+//! Failures increment counters; the first failure for any source should
+//! cause that source to be skipped by the cascade.
+
 /// Default assumed min-entropy per 64-bit sample (in bits).
-/// H=4.0 gives RCT cutoff of 11 and conservative APT thresholds.
-/// This is a deliberate underestimate for defense-in-depth:
-/// true hardware RNG entropy should be higher.
+///
+/// H=4.0 gives RCT cutoff of 11 and conservative APT thresholds. This is a
+/// deliberate underestimate for defense in depth: true hardware RNG entropy
+/// should be considerably higher, but overestimating here causes APT false
+/// negatives on legitimately flawed sources.
 pub const DEFAULT_MIN_ENTROPY_BITS: f64 = 4.0;
 
-/// Continuous health testing per NIST SP 800-90B.
-///
-/// Two tests run on every entropy sample:
-/// - **Repetition Count Test**: detects a stuck source (same output repeated beyond cutoff)
-/// - **Adaptive Proportion Test**: detects bias toward one value within a sliding window
-///
 /// Health test state for a single entropy source.
+///
+/// Holds streaming state for both RCT and APT so the caller can feed samples
+/// one at a time as they arrive from the source. Clone-free; intended to be
+/// owned by the source implementation for the lifetime of the process.
 pub struct HealthTester {
     // Repetition Count Test state
     rct_last_value: u64,
@@ -33,9 +45,22 @@ pub struct HealthTester {
 impl HealthTester {
     /// Create a new health tester.
     ///
-    /// `min_entropy_bits` is the estimated min-entropy per sample (H).
-    /// The RCT cutoff C = 1 + ceil(40 / H).
-    /// The APT window size W = 1024, cutoff based on binomial distribution.
+    /// `min_entropy_bits` is the estimated min-entropy per sample (H). The
+    /// RCT cutoff `C = 1 + ceil(40 / H)`. The APT window size is 1024; its
+    /// cutoff is derived from a normal approximation to the binomial with a
+    /// 5-sigma margin.
+    ///
+    /// A negative or zero `H` is clamped to a very conservative cutoff
+    /// (C = 42) so the tester still progresses instead of panicking.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mixrand::health::HealthTester;
+    /// let mut ht = HealthTester::new(4.0);
+    /// assert!(ht.feed(0xdead_beef).is_ok());
+    /// assert!(!ht.has_failures());
+    /// ```
     pub fn new(min_entropy_bits: f64) -> Self {
         let rct_cutoff = if min_entropy_bits <= 0.0 {
             42 // very conservative for unknown entropy
@@ -273,5 +298,171 @@ mod tests {
         for i in 1024..2048u64 {
             assert!(ht.feed(i).is_ok());
         }
+    }
+
+    // ---- edge-case tests for real-world pathological sources ----
+
+    #[test]
+    fn test_stuck_source_all_0xff_detected_within_cutoff() {
+        // Simulates a stuck hardware source returning 0xff...ff forever.
+        // H=4.0 -> RCT cutoff = 11. RCT must fail on or before the 11th sample.
+        let mut ht = HealthTester::new(4.0);
+        let mut failed_at = None;
+        for i in 0..20 {
+            if ht.feed(u64::MAX).is_err() {
+                failed_at = Some(i + 1);
+                break;
+            }
+        }
+        assert_eq!(failed_at, Some(11), "expected RCT to fail at 11th sample");
+        assert_eq!(ht.rct_failures(), 1);
+    }
+
+    #[test]
+    fn test_stuck_source_all_zeros_detected() {
+        // A source returning 0x00...00 is equally stuck.
+        let mut ht = HealthTester::new(4.0);
+        for _ in 0..10 {
+            assert!(ht.feed(0).is_ok());
+        }
+        assert!(ht.feed(0).is_err(), "11th zero should trigger RCT");
+    }
+
+    #[test]
+    fn test_biased_source_triggers_apt_but_not_rct() {
+        // Interleave 10 zeros with 1 unique value so the longest run of the
+        // candidate (0) is 10 — below RCT cutoff of 41 for H=1.0 — but the
+        // window still contains ~930/1024 zeros, above APT cutoff (~592).
+        let mut ht = HealthTester::new(1.0);
+        let mut triggered = false;
+        for i in 0u64..1200 {
+            let sample = if i % 11 == 10 { 0xdead_beef + i } else { 0 };
+            if ht.feed(sample).is_err() {
+                triggered = true;
+                break;
+            }
+        }
+        assert!(triggered, "APT should detect strong bias toward zero");
+        assert_eq!(ht.rct_failures(), 0, "should not be an RCT failure");
+        assert!(ht.apt_failures() >= 1, "should be at least one APT failure");
+    }
+
+    #[test]
+    fn test_apt_window_boundary_unique_values() {
+        // Feed exactly 1024 unique samples — window completes cleanly. Then
+        // feed another 1024 unique samples in a new window.
+        let mut ht = HealthTester::new(4.0);
+        for i in 0..1024u64 {
+            // Use distinct values to avoid RCT trigger.
+            assert!(ht.feed(i.wrapping_mul(1009) ^ 0xa5a5_a5a5).is_ok());
+        }
+        for i in 1024..2048u64 {
+            assert!(ht.feed(i.wrapping_mul(1009) ^ 0xa5a5_a5a5).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_rct_cutoff_formula_small_entropy() {
+        // H=2.0 -> cutoff = 1 + ceil(40/2) = 21
+        let ht = HealthTester::new(2.0);
+        assert_eq!(ht.rct_cutoff, 21);
+        // H=8.0 -> cutoff = 1 + ceil(40/8) = 6
+        let ht8 = HealthTester::new(8.0);
+        assert_eq!(ht8.rct_cutoff, 6);
+    }
+
+    #[test]
+    fn test_rct_count_resets_on_different_then_repeats() {
+        // Ensure counter resets cleanly and a fresh repetition sequence has
+        // its own cutoff budget.
+        let mut ht = HealthTester::new(4.0);
+        for _ in 0..5 {
+            assert!(ht.feed(1).is_ok());
+        }
+        assert!(ht.feed(2).is_ok()); // reset
+        for _ in 0..10 {
+            assert!(ht.feed(3).is_ok());
+        }
+        // 11 total repetitions of 3 triggers RCT
+        assert!(ht.feed(3).is_err());
+    }
+
+    // --- Property-style monotonicity checks for cutoffs ---
+
+    #[test]
+    fn property_rct_cutoff_monotone_in_h() {
+        // Lower H -> larger RCT cutoff (more tolerant of repetition because
+        // repetition is more expected under low entropy).
+        let hs = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
+        let cutoffs: Vec<u32> = hs
+            .iter()
+            .map(|&h| HealthTester::new(h).rct_cutoff)
+            .collect();
+        for win in cutoffs.windows(2) {
+            assert!(
+                win[0] >= win[1],
+                "RCT cutoff should be non-increasing in H: {cutoffs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn property_apt_cutoff_monotone_in_h() {
+        // Lower H -> larger APT cutoff (more samples may match the
+        // candidate under low entropy without being anomalous).
+        let hs = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
+        let cutoffs: Vec<u32> = hs
+            .iter()
+            .map(|&h| HealthTester::new(h).apt_cutoff)
+            .collect();
+        for win in cutoffs.windows(2) {
+            assert!(
+                win[0] >= win[1],
+                "APT cutoff should be non-increasing in H: {cutoffs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rct_cutoff_at_h_4_equals_11() {
+        // Pin the SP 800-90B reference cutoff: 1 + ceil(40/4) = 11.
+        let ht = HealthTester::new(4.0);
+        assert_eq!(ht.rct_cutoff, 11);
+    }
+
+    #[test]
+    fn test_apt_window_rolls_over_after_1024() {
+        // Fed a candidate value for 1024 samples then a fresh value — the
+        // next window restarts, so the candidate counter is not leaking
+        // across boundaries.
+        let mut ht = HealthTester::new(4.0);
+        // First 1024 samples: all 0xAA then flip to 0xBB (two distinct
+        // windows). Because RCT would trip at 11 repetitions, vary within
+        // a window while still rolling the APT boundary over.
+        for i in 0..1024u64 {
+            let v = i; // distinct each sample — RCT-safe
+            assert!(ht.feed(v).is_ok(), "sample {i} unexpectedly rejected");
+        }
+        // Window restart: first sample of new window becomes the new
+        // candidate. One more sample is trivially OK.
+        assert!(ht.feed(0xDEAD_BEEF).is_ok());
+        assert!(ht.feed(0xCAFE_D00D).is_ok());
+    }
+
+    #[test]
+    fn test_rct_resets_cleanly_across_distinct_samples() {
+        // After a 9-run of value A, a B (reset), then repetitions of C must
+        // get a fresh cutoff budget of 11.
+        let mut ht = HealthTester::new(4.0);
+        for _ in 0..9 {
+            assert!(ht.feed(100).is_ok());
+        }
+        assert!(ht.feed(200).is_ok()); // reset
+                                       // Build up a fresh repetition run of 300. feed(300) produces
+                                       // rct_count=1, then 2, 3, ... Up to 10 remain OK; the 11th errors.
+        for i in 0..10 {
+            assert!(ht.feed(300).is_ok(), "iter {i} unexpectedly failed");
+        }
+        assert!(ht.feed(300).is_err());
     }
 }

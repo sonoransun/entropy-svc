@@ -20,11 +20,7 @@ pub struct Pkcs11Source {
 impl Pkcs11Source {
     pub fn new(config: &Pkcs11Config) -> Self {
         Self {
-            library_path: config
-                .library_path
-                .as_deref()
-                .unwrap_or("")
-                .to_string(),
+            library_path: config.library_path.as_deref().unwrap_or("").to_string(),
             slot_index: config.slot_id.unwrap_or(0) as usize,
             pin: config.pin.clone(),
         }
@@ -53,17 +49,16 @@ impl EntropySource for Pkcs11Source {
     }
 
     fn collect(&self, count: usize) -> Result<Vec<u8>, Error> {
-        let pkcs11 = Pkcs11::new(&self.library_path).map_err(|e| {
-            Error::NoEntropy(format!("PKCS#11 library load failed: {}", e))
-        })?;
+        let pkcs11 = Pkcs11::new(&self.library_path)
+            .map_err(|e| Error::NoEntropy(format!("PKCS#11 library load failed: {}", e)))?;
 
-        pkcs11.initialize(CInitializeArgs::OsThreads).map_err(|e| {
-            Error::NoEntropy(format!("PKCS#11 initialize failed: {}", e))
-        })?;
+        pkcs11
+            .initialize(CInitializeArgs::OsThreads)
+            .map_err(|e| Error::NoEntropy(format!("PKCS#11 initialize failed: {}", e)))?;
 
-        let slots = pkcs11.get_slots_with_token().map_err(|e| {
-            Error::NoEntropy(format!("PKCS#11 get_slots_with_token failed: {}", e))
-        })?;
+        let slots = pkcs11
+            .get_slots_with_token()
+            .map_err(|e| Error::NoEntropy(format!("PKCS#11 get_slots_with_token failed: {}", e)))?;
 
         let slot = slots.get(self.slot_index).ok_or_else(|| {
             Error::NoEntropy(format!(
@@ -73,21 +68,19 @@ impl EntropySource for Pkcs11Source {
             ))
         })?;
 
-        let session = pkcs11.open_ro_session(*slot).map_err(|e| {
-            Error::NoEntropy(format!("PKCS#11 open_ro_session failed: {}", e))
-        })?;
+        let session = pkcs11
+            .open_ro_session(*slot)
+            .map_err(|e| Error::NoEntropy(format!("PKCS#11 open_ro_session failed: {}", e)))?;
 
         if let Some(ref pin) = self.pin {
             session
                 .login(UserType::User, Some(&AuthPin::new(pin.clone())))
-                .map_err(|e| {
-                    Error::NoEntropy(format!("PKCS#11 login failed: {}", e))
-                })?;
+                .map_err(|e| Error::NoEntropy(format!("PKCS#11 login failed: {}", e)))?;
         }
 
-        let bytes = session.generate_random(count).map_err(|e| {
-            Error::NoEntropy(format!("PKCS#11 generate_random failed: {}", e))
-        })?;
+        let bytes = session
+            .generate_random(count)
+            .map_err(|e| Error::NoEntropy(format!("PKCS#11 generate_random failed: {}", e)))?;
 
         Ok(bytes)
     }

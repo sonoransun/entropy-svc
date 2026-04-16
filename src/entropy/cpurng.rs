@@ -41,11 +41,17 @@ mod x86 {
             return cached == 2;
         }
 
-        // SAFETY: CPUID is always available on x86_64.
+        // SAFETY: CPUID is always available on x86_64 (baseline since
+        // 1994 Pentium). `cpuid` clobbers EBX, but Rust's inline asm
+        // reserves the RBX register on x86_64 — LLVM cannot allocate it
+        // and rejects `out("rbx") _` / `clobber_abi(...)` for it. The
+        // standard workaround is a manual `push rbx` / `pop rbx` around
+        // the `cpuid`; see rust-lang/rust#84658. The other cpuid sites
+        // in this module apply the same reasoning.
         let ecx: u32;
         unsafe {
             asm!(
-                "push rbx",       // rbx is callee-saved
+                "push rbx",
                 "mov eax, 1",
                 "cpuid",
                 "mov {ecx:e}, ecx",
@@ -69,7 +75,8 @@ mod x86 {
             return cached == 2;
         }
 
-        // SAFETY: CPUID is always available on x86_64.
+        // SAFETY: CPUID is always available on x86_64; rbx preservation as
+        // documented on `has_rdrand` above (push/pop around cpuid).
         let ebx: u32;
         unsafe {
             asm!(
@@ -99,6 +106,7 @@ mod x86 {
         }
 
         // First check if Centaur extended range is available.
+        // SAFETY: cpuid + rbx preservation as documented on `has_rdrand`.
         let max_centaur: u32;
         unsafe {
             asm!(
@@ -120,6 +128,7 @@ mod x86 {
         }
 
         // Check leaf 0xC0000001 EDX bit 2 (RNG present) and bit 3 (RNG enabled).
+        // SAFETY: cpuid + rbx preservation as documented on `has_rdrand`.
         let edx: u32;
         unsafe {
             asm!(
@@ -604,24 +613,16 @@ pub fn collect_cpu_entropy_standalone(
     let output = if count > crate::csprng::RESEED_INTERVAL {
         let cfg = config.clone();
         let os = config.oversample;
-        crate::csprng::generate_reseeding(
-            seed,
-            count,
-            crate::csprng::RESEED_INTERVAL,
-            move || {
-                let raw = cfg
-                    .fallback_mix_bytes
-                    .max(32)
-                    .saturating_mul(os as usize);
-                let fresh = collect_cpu_entropy(raw, &cfg)
-                    .map(|r| r.bytes)
-                    .unwrap_or_else(|_| vec![0u8; 32]);
-                let mut fb = fresh;
-                let s = crate::mixer::mix_entropy(&[("cpu-rng-reseed", &fb)]);
-                zeroize_vec(&mut fb);
-                s
-            },
-        )
+        crate::csprng::generate_reseeding(seed, count, crate::csprng::RESEED_INTERVAL, move || {
+            let raw = cfg.fallback_mix_bytes.max(32).saturating_mul(os as usize);
+            let fresh = collect_cpu_entropy(raw, &cfg)
+                .map(|r| r.bytes)
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            let mut fb = fresh;
+            let s = crate::mixer::mix_entropy(&[("cpu-rng-reseed", &fb)]);
+            zeroize_vec(&mut fb);
+            s
+        })
     } else {
         crate::csprng::generate(seed, count)
     };

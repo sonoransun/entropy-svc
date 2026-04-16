@@ -118,10 +118,7 @@ struct CheckResult {
     sources: Vec<SourceResult>,
 }
 
-fn build_source_result(
-    source: &dyn EntropySource,
-    stat: &SourceStats,
-) -> SourceResult {
+fn build_source_result(source: &dyn EntropySource, stat: &SourceStats) -> SourceResult {
     let chi = stat.avg(stat.chi_square_sum);
     SourceResult {
         name: source.name().to_string(),
@@ -489,13 +486,13 @@ fn output_json(
             .map(|(s, st)| build_source_result(s.as_ref(), st))
             .collect(),
     };
-    println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
 }
 
-fn output_csv(
-    sources: &[Box<dyn EntropySource>],
-    stats_vec: &[SourceStats],
-) {
+fn output_csv(sources: &[Box<dyn EntropySource>], stats_vec: &[SourceStats]) {
     println!(
         "source,samples,bytes,throughput_bps,errors,\
          fips_monobit_pct,fips_poker_pct,fips_runs_pct,fips_long_runs_pct,fips_all_pct,\
@@ -508,10 +505,27 @@ fn output_csv(
             "{},{},{},{:.2},{},{:.1},{:.1},{:.1},{:.1},{:.1},\
              {:.4},{:.4},{:.1},{:.4},{:.2},{:.6},\
              {:.4},{:.4},{:.4},{:.4},{:.4}",
-            r.name, r.samples, r.bytes, r.throughput_bytes_per_sec, r.errors,
-            r.fips_monobit_pct, r.fips_poker_pct, r.fips_runs_pct, r.fips_long_runs_pct, r.fips_all_pct,
-            r.shannon, r.min_entropy, r.chi_square, r.chi_square_p, r.mean, r.serial_correlation,
-            r.approx_entropy_m2, r.approx_entropy_m3, r.compression_ratio, r.block_entropy_2, r.block_entropy_4
+            r.name,
+            r.samples,
+            r.bytes,
+            r.throughput_bytes_per_sec,
+            r.errors,
+            r.fips_monobit_pct,
+            r.fips_poker_pct,
+            r.fips_runs_pct,
+            r.fips_long_runs_pct,
+            r.fips_all_pct,
+            r.shannon,
+            r.min_entropy,
+            r.chi_square,
+            r.chi_square_p,
+            r.mean,
+            r.serial_correlation,
+            r.approx_entropy_m2,
+            r.approx_entropy_m3,
+            r.compression_ratio,
+            r.block_entropy_2,
+            r.block_entropy_4
         );
     }
 }
@@ -521,7 +535,9 @@ const MAX_SAMPLE_SIZE: usize = 10 * 1024 * 1024;
 
 pub fn run(args: &CheckArgs, config: &Config) -> Result<(), Error> {
     if args.sample_size == 0 {
-        return Err(Error::InvalidArgs("sample-size must be greater than 0".into()));
+        return Err(Error::InvalidArgs(
+            "sample-size must be greater than 0".into(),
+        ));
     }
     if args.sample_size > MAX_SAMPLE_SIZE {
         return Err(Error::InvalidArgs(format!(
@@ -665,7 +681,13 @@ pub fn run(args: &CheckArgs, config: &Config) -> Result<(), Error> {
     }
 
     match args.output_format {
-        CheckOutputFormat::Json => output_json(&sources, &stats_vec, total_elapsed, args.sample_size, do_fips),
+        CheckOutputFormat::Json => output_json(
+            &sources,
+            &stats_vec,
+            total_elapsed,
+            args.sample_size,
+            do_fips,
+        ),
         CheckOutputFormat::Csv => output_csv(&sources, &stats_vec),
         CheckOutputFormat::Text => print_final_report(&sources, &stats_vec, do_fips),
     }
@@ -818,7 +840,10 @@ mod tests {
 
     #[test]
     fn test_parse_duration_large_value() {
-        assert_eq!(parse_duration("365d").unwrap(), Duration::from_secs(365 * 86400));
+        assert_eq!(
+            parse_duration("365d").unwrap(),
+            Duration::from_secs(365 * 86400)
+        );
     }
 
     #[test]

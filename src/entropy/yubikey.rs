@@ -10,9 +10,7 @@ const YUBIKEY_MAX_LE: u8 = 32;
 
 /// SELECT PIV applet APDU: CLA=00, INS=A4 (SELECT), P1=04 (by name),
 /// P2=00, Lc=05, AID=A0 00 00 03 08.
-const SELECT_PIV: [u8; 10] = [
-    0x00, 0xA4, 0x04, 0x00, 0x05, 0xA0, 0x00, 0x00, 0x03, 0x08,
-];
+const SELECT_PIV: [u8; 10] = [0x00, 0xA4, 0x04, 0x00, 0x05, 0xA0, 0x00, 0x00, 0x03, 0x08];
 
 /// Entropy source that collects random bytes from a YubiKey via the PIV
 /// applet's GET CHALLENGE command over PC/SC.
@@ -63,9 +61,9 @@ impl EntropySource for YubiKeySource {
             Err(_) => return false,
         };
 
-        readers.into_iter().any(|r| {
-            is_yubikey_reader(&r.to_string_lossy())
-        })
+        readers
+            .into_iter()
+            .any(|r| is_yubikey_reader(&r.to_string_lossy()))
     }
 
     fn collect(&self, count: usize) -> Result<Vec<u8>, Error> {
@@ -115,11 +113,9 @@ impl EntropySource for YubiKeySource {
             let le = remaining.min(YUBIKEY_MAX_LE as usize) as u8;
             let apdu = [0x00, 0x84, 0x00, 0x00, le];
 
-            let resp = card
-                .transmit(&apdu, &mut resp_buf)
-                .map_err(|e| {
-                    Error::NoEntropy(format!("YubiKey: GET CHALLENGE transmit failed: {}", e))
-                })?;
+            let resp = card.transmit(&apdu, &mut resp_buf).map_err(|e| {
+                Error::NoEntropy(format!("YubiKey: GET CHALLENGE transmit failed: {}", e))
+            })?;
 
             if resp.len() < 2 {
                 return Err(Error::NoEntropy(

@@ -1,3 +1,13 @@
+//! Structured logging for mixrand.
+//!
+//! Installs a global [`log`]-crate sink that can fan out to any combination
+//! of stderr, a log file, and syslog. Supports text (default) and JSON
+//! formats. Timestamps are RFC3339 with millisecond resolution.
+//!
+//! Log level defaults differ by operating mode: `info` for the long-running
+//! daemon, `warn` for one-shot CLI invocations. The user can override with
+//! `--log-level` or the `-v`/`-q` shortcuts.
+
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -9,11 +19,16 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 
 type SyslogLogger = syslog::Logger<syslog::LoggerBackend, syslog::Formatter3164>;
 
+/// Minimum log level emitted by the configured sinks.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum LogLevel {
+    /// Error messages only.
     Error,
+    /// Warnings and errors (default for one-shot CLI).
     Warn,
+    /// Info, warnings, errors (default for daemon).
     Info,
+    /// All log messages including verbose debug tracing.
     Debug,
 }
 
@@ -28,14 +43,16 @@ impl LogLevel {
     }
 }
 
+/// Output format used by the logger.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum LogFormat {
-    /// Human-readable text with timestamps
+    /// Human-readable text with timestamps (default).
     Text,
-    /// Structured JSON (one object per line)
+    /// Structured JSON (one object per line).
     Json,
 }
 
+/// CLI-visible logging arguments, flattened into every subcommand.
 #[derive(Debug, Clone, Args)]
 pub struct LogArgs {
     /// Log level (default: warn for one-shot, info for daemon)

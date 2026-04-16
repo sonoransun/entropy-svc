@@ -1,0 +1,63 @@
+[Unit]
+Description=mixrand entropy daemon
+Documentation=man:mixrand(1)
+After=network.target
+ConditionPathIsReadWrite=/dev/random
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/mixrand daemon \
+    --config /etc/mixrand.toml \
+    --pid-file /run/mixrand/mixrand.pid \
+    --user mixrand
+
+# Started as root so the daemon can open /dev/random for writing, install
+# signal handlers, and create the PID file in /run/mixrand; mixrand drops
+# to the --user account before entering the main loop.
+RuntimeDirectory=mixrand
+RuntimeDirectoryMode=0755
+PIDFile=/run/mixrand/mixrand.pid
+
+Restart=on-failure
+RestartSec=5s
+WatchdogSec=60s
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged @debug @obsolete
+
+# /dev access: rw on /dev/random for RNDADDENTROPY, r on /dev/hwrng for
+# hardware RNG reads, r on /dev/urandom as a fallback seed source.
+PrivateDevices=no
+DeviceAllow=/dev/random rw
+DeviceAllow=/dev/hwrng r
+DeviceAllow=/dev/urandom r
+
+# Capabilities the daemon actually uses:
+#   CAP_SYS_ADMIN  — ioctl(RNDADDENTROPY) on /dev/random.
+#   CAP_IPC_LOCK   — mlockall to prevent entropy buffers hitting swap.
+#   CAP_SETUID     — drop privileges in drop_privileges().
+#   CAP_SETGID     — same.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_IPC_LOCK CAP_SETUID CAP_SETGID
+AmbientCapabilities=
+
+# ProtectKernelTunables=no because the daemon WRITES to /dev/random; the
+# kernel accepts this via the ioctl without tunable-level touches, but
+# this directive is relaxed defensively.
+ProtectKernelTunables=no
+
+[Install]
+WantedBy=multi-user.target

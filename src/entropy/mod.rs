@@ -6,6 +6,8 @@ pub mod gnupg;
 pub mod haveged;
 pub mod hwrng;
 pub mod jitter;
+#[cfg(any(test, feature = "testing"))]
+pub mod mock;
 #[cfg(feature = "pcsc")]
 pub mod pcsc;
 #[cfg(feature = "pkcs11")]
@@ -15,10 +17,10 @@ pub mod procfs;
 pub mod sgx;
 #[cfg(feature = "tpm2")]
 pub mod tpm2;
-#[cfg(feature = "yubikey")]
-pub mod yubikey;
 #[cfg(feature = "yubihsm-native")]
 pub mod yubihsm;
+#[cfg(feature = "yubikey")]
+pub mod yubikey;
 
 use std::path::Path;
 
@@ -437,15 +439,21 @@ fn add_hsm_sources(sources: &mut Vec<Box<dyn EntropySource>>, config: &Config) {
 }
 
 /// Build the sources used by `generate()` (main entropy cascade).
+///
+/// Priority order (lower = tried first): SGX (4), TPM2 (5), PKCS#11/YubiHSM
+/// (6), YubiKey/PC/SC (7), GnuPG (8), hwrng (10), cpurng (20), haveged (30),
+/// getrandom (35), urandom (36), fallback (40). When a source fails its
+/// health check, the cascade falls through to the next available source —
+/// `fallback` is always last and always available.
 pub fn build_generate_sources(config: &Config) -> Vec<Box<dyn EntropySource>> {
-    let mut sources: Vec<Box<dyn EntropySource>> = vec![
-        Box::new(HwrngSource),
-    ];
+    let mut sources: Vec<Box<dyn EntropySource>> = vec![Box::new(HwrngSource)];
 
     add_hsm_sources(&mut sources, config);
 
     sources.push(Box::new(CpuRngStandaloneSource::new(&config.cpu_rng)));
     sources.push(Box::new(HavegedSource));
+    sources.push(Box::new(GetrandomSource));
+    sources.push(Box::new(UrandomSource));
     sources.push(Box::new(FallbackSource::new(&config.cpu_rng)));
 
     sources.sort_by_key(|s| s.priority());
@@ -551,13 +559,31 @@ mod tests {
     fn test_build_generate_sources_has_core() {
         let config = Config::default();
         let sources = build_generate_sources(&config);
-        // At minimum: hwrng, cpurng, haveged, fallback
-        assert!(sources.len() >= 4);
+        // At minimum: hwrng, cpurng, haveged, getrandom, urandom, fallback
+        assert!(sources.len() >= 6);
         let names: Vec<&str> = sources.iter().map(|s| s.name()).collect();
         assert!(names.contains(&"hwrng"));
         assert!(names.contains(&"cpurng"));
         assert!(names.contains(&"haveged"));
+        assert!(names.contains(&"getrandom"));
+        assert!(names.contains(&"urandom"));
         assert!(names.contains(&"fallback"));
+    }
+
+    #[test]
+    fn test_build_generate_sources_priority_ordering() {
+        // urandom (36) must appear before fallback (40), after haveged (30).
+        let config = Config::default();
+        let sources = build_generate_sources(&config);
+        let pos_of =
+            |name: &str| -> Option<usize> { sources.iter().position(|s| s.name() == name) };
+        let (haveged, urandom, fallback) = (
+            pos_of("haveged").unwrap(),
+            pos_of("urandom").unwrap(),
+            pos_of("fallback").unwrap(),
+        );
+        assert!(haveged < urandom);
+        assert!(urandom < fallback);
     }
 
     #[test]

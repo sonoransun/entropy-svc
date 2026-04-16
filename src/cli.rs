@@ -1,3 +1,11 @@
+//! Command-line interface definitions for `mixrand`.
+//!
+//! Parsed by the binary at startup via clap derive macros. The main [`Cli`]
+//! struct carries both the generate-mode flags and one of the subcommand
+//! variants in [`Command`]. Every subcommand flattens three argument groups:
+//! [`CpuRngArgs`], [`HsmArgs`], and [`crate::logging::LogArgs`], so the user
+//! can tune CPU RNG, HSM, and logging behavior uniformly across modes.
+
 use std::path::PathBuf;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -6,6 +14,7 @@ use clap_complete::Shell;
 use crate::config::{CpuRngPreference, MixerMode};
 use crate::logging::LogArgs;
 
+/// Output format selector for the generate subcommand.
 #[derive(Debug, Clone, ValueEnum)]
 pub enum OutputFormat {
     /// Hexadecimal lowercase (default, e.g. a1b2c3)
@@ -28,6 +37,7 @@ pub enum OutputFormat {
     HexUpper,
 }
 
+/// Output format selector shared by `check` and `bench`.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CheckOutputFormat {
     /// Human-readable text (default)
@@ -38,6 +48,11 @@ pub enum CheckOutputFormat {
     Csv,
 }
 
+/// HSM / secure-element flags flattened into every subcommand.
+///
+/// Sensitive values (PINs, passwords) are accepted but trigger a runtime
+/// WARN — see `crate::main::build_config`. Prefer the `MIXRAND_*` env-var
+/// equivalents for real deployments.
 #[derive(Debug, Args)]
 pub struct HsmArgs {
     /// Enable TPM2 entropy source
@@ -75,6 +90,37 @@ pub struct HsmArgs {
     /// TPM2 device path (default: /dev/tpmrm0)
     #[arg(long)]
     pub tpm2_device: Option<String>,
+
+    /// PKCS#11 user PIN (WARNING: visible in process list — prefer MIXRAND_PKCS11_PIN env var)
+    #[arg(long)]
+    pub pkcs11_pin: Option<String>,
+
+    /// YubiHSM authentication password (WARNING: visible in process list — prefer MIXRAND_YUBIHSM_PASSWORD env var)
+    #[arg(long)]
+    pub yubihsm_password: Option<String>,
+}
+
+impl HsmArgs {
+    /// Returns true if any CLI-supplied flag carries a secret value that would
+    /// be visible to other processes via `/proc/<pid>/cmdline` or the output
+    /// of `ps`. Used to emit a runtime warning suggesting the env-var
+    /// equivalent.
+    pub fn has_cli_secret(&self) -> bool {
+        self.pkcs11_pin.is_some() || self.yubihsm_password.is_some()
+    }
+
+    /// Human-readable list of names of flags found to carry CLI-visible
+    /// secrets. Empty if none.
+    pub fn cli_secret_names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.pkcs11_pin.is_some() {
+            names.push("--pkcs11-pin");
+        }
+        if self.yubihsm_password.is_some() {
+            names.push("--yubihsm-password");
+        }
+        names
+    }
 }
 
 #[derive(Debug, Args)]
@@ -202,6 +248,8 @@ pub enum Command {
     Daemon(DaemonArgs),
     /// Run FIPS 140-2 statistical tests and entropy estimates against each entropy source
     Check(CheckArgs),
+    /// Measure throughput (bytes/s, samples/s) of each entropy source
+    Bench(BenchArgs),
     /// Generate shell completions for bash, zsh, fish, or PowerShell
     Completions(CompletionsArgs),
     /// List available entropy sources and their status
@@ -233,6 +281,15 @@ pub struct DaemonArgs {
     /// Path to PID file (checks for stale PIDs on startup)
     #[arg(long)]
     pub pid_file: Option<PathBuf>,
+
+    /// Skip the startup self-test (not recommended).
+    ///
+    /// By default the daemon probes every configured source and runs a
+    /// NIST SP 800-90B health pass on the samples before signaling READY
+    /// to systemd. With this flag the daemon enters the main loop
+    /// immediately; use only for debugging.
+    #[arg(long, default_value_t = false)]
+    pub no_self_test: bool,
 
     /// Configuration file path (default: /etc/mixrand.toml)
     #[arg(long = "config")]
@@ -267,6 +324,46 @@ pub struct CheckArgs {
     pub sources: Option<Vec<String>>,
 
     /// Suppress progress output (only print final results)
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    /// Output format for results
+    #[arg(long = "output-format", value_enum, default_value_t = CheckOutputFormat::Text)]
+    pub output_format: CheckOutputFormat,
+
+    /// Configuration file path (default: /etc/mixrand.toml)
+    #[arg(long = "config")]
+    pub config_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub cpu_rng: CpuRngArgs,
+
+    #[command(flatten)]
+    pub hsm: HsmArgs,
+
+    #[command(flatten)]
+    pub log: LogArgs,
+}
+
+#[derive(Debug, Parser)]
+pub struct BenchArgs {
+    /// Per-source benchmark duration (e.g. 3s, 30s, 2m, 1h; bare number = seconds)
+    #[arg(short = 'd', long, default_value = "3s")]
+    pub duration: String,
+
+    /// Bytes per sample call
+    #[arg(short = 's', long, default_value_t = 4096)]
+    pub sample_size: usize,
+
+    /// Optional byte budget per source (stops once reached)
+    #[arg(long)]
+    pub max_bytes: Option<u64>,
+
+    /// Comma-separated list of sources to benchmark (default: all)
+    #[arg(long, value_delimiter = ',')]
+    pub sources: Option<Vec<String>>,
+
+    /// Suppress progress chatter on stderr
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
@@ -327,10 +424,13 @@ mod tests {
         let cli = Cli::try_parse_from(["mixrand"]).unwrap();
         assert_eq!(cli.bytes, 32);
         assert!(matches!(cli.format, OutputFormat::Hex));
-        assert_eq!(cli.verbose, false);
-        assert_eq!(cli.quiet, false);
+        assert!(!cli.verbose);
+        assert!(!cli.quiet);
         assert!(cli.command.is_none());
         assert!(cli.count.is_none());
+        assert!(cli.output_file.is_none());
+        assert!(cli.config_file.is_none());
+        assert!(!cli.show_config);
     }
 
     #[test]
@@ -338,7 +438,7 @@ mod tests {
         let cli = Cli::try_parse_from(["mixrand", "-n", "64", "-f", "base64", "-v"]).unwrap();
         assert_eq!(cli.bytes, 64);
         assert!(matches!(cli.format, OutputFormat::Base64));
-        assert_eq!(cli.verbose, true);
+        assert!(cli.verbose);
     }
 
     #[test]
@@ -350,5 +450,298 @@ mod tests {
             }
             other => panic!("expected Some(Command::Check(_)), got {:?}", other),
         }
+    }
+
+    // ---- format variants ----
+
+    #[test]
+    fn test_every_output_format_parses() {
+        for (arg, matcher) in [
+            ("hex", |f| matches!(f, OutputFormat::Hex)),
+            ("hex-upper", |f| matches!(f, OutputFormat::HexUpper)),
+            ("raw", |f| matches!(f, OutputFormat::Raw)),
+            ("base64", |f| matches!(f, OutputFormat::Base64)),
+            ("base64url", |f| matches!(f, OutputFormat::Base64url)),
+            ("uuencode", |f| matches!(f, OutputFormat::Uuencode)),
+            ("text", |f| matches!(f, OutputFormat::Text)),
+            ("octal", |f| matches!(f, OutputFormat::Octal)),
+            ("binary", |f| matches!(f, OutputFormat::Binary)),
+        ] as [(&str, fn(&OutputFormat) -> bool); 9]
+        {
+            let cli = Cli::try_parse_from(["mixrand", "-f", arg]).unwrap();
+            assert!(matcher(&cli.format), "format {:?} did not match", arg);
+        }
+    }
+
+    #[test]
+    fn test_invalid_output_format_rejected() {
+        let result = Cli::try_parse_from(["mixrand", "-f", "yaml"]);
+        assert!(result.is_err());
+    }
+
+    // ---- flag defaults & overrides ----
+
+    #[test]
+    fn test_count_flag() {
+        let cli = Cli::try_parse_from(["mixrand", "--count", "5"]).unwrap();
+        assert_eq!(cli.count, Some(5));
+    }
+
+    #[test]
+    fn test_output_file_flag() {
+        let cli = Cli::try_parse_from(["mixrand", "-o", "/tmp/out.bin"]).unwrap();
+        assert_eq!(
+            cli.output_file.as_deref(),
+            Some(std::path::Path::new("/tmp/out.bin"))
+        );
+    }
+
+    #[test]
+    fn test_config_file_flag() {
+        let cli = Cli::try_parse_from(["mixrand", "--config", "/etc/test.toml"]).unwrap();
+        assert_eq!(
+            cli.config_file.as_deref(),
+            Some(std::path::Path::new("/etc/test.toml"))
+        );
+    }
+
+    #[test]
+    fn test_show_config_flag() {
+        let cli = Cli::try_parse_from(["mixrand", "--show-config"]).unwrap();
+        assert!(cli.show_config);
+    }
+
+    #[test]
+    fn test_quiet_verbose_mutually_exclusive() {
+        let result = Cli::try_parse_from(["mixrand", "-q", "-v"]);
+        assert!(result.is_err(), "-q and -v should be mutually exclusive");
+    }
+
+    // ---- CPU RNG flags ----
+
+    #[test]
+    fn test_cpu_rng_enable_flags_absent_default_none() {
+        let cli = Cli::try_parse_from(["mixrand"]).unwrap();
+        assert!(cli.cpu_rng.enable_rdseed.is_none());
+        assert!(cli.cpu_rng.enable_rdrand.is_none());
+        assert!(cli.cpu_rng.enable_xstore.is_none());
+    }
+
+    #[test]
+    fn test_cpu_rng_enable_rdseed_bool_forms() {
+        let t = Cli::try_parse_from(["mixrand", "--enable-rdseed", "true"]).unwrap();
+        assert_eq!(t.cpu_rng.enable_rdseed, Some(true));
+        let f = Cli::try_parse_from(["mixrand", "--enable-rdseed", "false"]).unwrap();
+        assert_eq!(f.cpu_rng.enable_rdseed, Some(false));
+        // Bare flag (default_missing_value="true")
+        let bare = Cli::try_parse_from(["mixrand", "--enable-rdseed"]).unwrap();
+        assert_eq!(bare.cpu_rng.enable_rdseed, Some(true));
+    }
+
+    #[test]
+    fn test_cpu_rng_retries_flags() {
+        let cli =
+            Cli::try_parse_from(["mixrand", "--rdrand-retries", "7", "--rdseed-retries", "3"])
+                .unwrap();
+        assert_eq!(cli.cpu_rng.rdrand_retries, Some(7));
+        assert_eq!(cli.cpu_rng.rdseed_retries, Some(3));
+    }
+
+    #[test]
+    fn test_cpu_rng_prefer_enum() {
+        let cli = Cli::try_parse_from(["mixrand", "--cpu-rng-prefer", "rdrand"]).unwrap();
+        assert_eq!(cli.cpu_rng.cpu_rng_prefer, Some(CpuRngPreference::Rdrand));
+    }
+
+    #[test]
+    fn test_cpu_rng_prefer_invalid_rejected() {
+        let result = Cli::try_parse_from(["mixrand", "--cpu-rng-prefer", "notarealthing"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cpu_rng_mixer_mode_enum() {
+        let cli = Cli::try_parse_from(["mixrand", "--mixer-mode", "hkdf"]).unwrap();
+        assert_eq!(cli.cpu_rng.mixer_mode, Some(MixerMode::Hkdf));
+    }
+
+    #[test]
+    fn test_cpu_rng_oversample_and_fallback_bytes() {
+        let cli = Cli::try_parse_from([
+            "mixrand",
+            "--oversample",
+            "4",
+            "--fallback-mix-bytes",
+            "128",
+        ])
+        .unwrap();
+        assert_eq!(cli.cpu_rng.oversample, Some(4));
+        assert_eq!(cli.cpu_rng.fallback_mix_bytes, Some(128));
+    }
+
+    // ---- HSM flags ----
+
+    #[test]
+    fn test_hsm_enable_flags() {
+        let cli = Cli::try_parse_from([
+            "mixrand",
+            "--enable-tpm2",
+            "false",
+            "--enable-pkcs11",
+            "true",
+            "--enable-gnupg",
+            "--enable-sgx",
+        ])
+        .unwrap();
+        assert_eq!(cli.hsm.enable_tpm2, Some(false));
+        assert_eq!(cli.hsm.enable_pkcs11, Some(true));
+        assert_eq!(cli.hsm.enable_gnupg, Some(true));
+        assert_eq!(cli.hsm.enable_sgx, Some(true));
+    }
+
+    #[test]
+    fn test_hsm_pkcs11_library_and_tpm2_device() {
+        let cli = Cli::try_parse_from([
+            "mixrand",
+            "--pkcs11-library",
+            "/usr/lib/foo.so",
+            "--tpm2-device",
+            "/dev/tpmrm1",
+        ])
+        .unwrap();
+        assert_eq!(cli.hsm.pkcs11_library.as_deref(), Some("/usr/lib/foo.so"));
+        assert_eq!(cli.hsm.tpm2_device.as_deref(), Some("/dev/tpmrm1"));
+    }
+
+    // ---- Subcommands ----
+
+    #[test]
+    fn test_daemon_subcommand_defaults() {
+        let cli = Cli::try_parse_from(["mixrand", "daemon"]).unwrap();
+        match cli.command {
+            Some(Command::Daemon(args)) => {
+                assert_eq!(args.threshold, 256);
+                assert_eq!(args.interval, 5);
+                assert_eq!(args.batch_size, 64);
+                assert_eq!(args.credit_ratio, 4);
+                assert!(args.user.is_none());
+                assert!(args.pid_file.is_none());
+            }
+            other => panic!("expected Daemon(_), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_daemon_credit_ratio_bounds() {
+        let too_low = Cli::try_parse_from(["mixrand", "daemon", "-c", "0"]);
+        assert!(too_low.is_err());
+        let too_high = Cli::try_parse_from(["mixrand", "daemon", "-c", "9"]);
+        assert!(too_high.is_err());
+        let ok = Cli::try_parse_from(["mixrand", "daemon", "-c", "8"]).unwrap();
+        match ok.command {
+            Some(Command::Daemon(args)) => assert_eq!(args.credit_ratio, 8),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_daemon_user_and_pidfile() {
+        let cli = Cli::try_parse_from([
+            "mixrand",
+            "daemon",
+            "--user",
+            "_entropy",
+            "--pid-file",
+            "/run/m.pid",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Daemon(args)) => {
+                assert_eq!(args.user.as_deref(), Some("_entropy"));
+                assert_eq!(
+                    args.pid_file.as_deref(),
+                    Some(std::path::Path::new("/run/m.pid"))
+                );
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_check_subcommand_defaults() {
+        let cli = Cli::try_parse_from(["mixrand", "check"]).unwrap();
+        match cli.command {
+            Some(Command::Check(args)) => {
+                assert_eq!(args.duration, "1m");
+                assert_eq!(args.sample_size, 2500);
+                assert_eq!(args.report_interval, 10);
+                assert!(args.sources.is_none());
+                assert!(!args.quiet);
+                assert!(matches!(args.output_format, CheckOutputFormat::Text));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_check_output_format_variants() {
+        for (arg, matcher) in [
+            ("text", |f| matches!(f, CheckOutputFormat::Text)),
+            ("json", |f| matches!(f, CheckOutputFormat::Json)),
+            ("csv", |f| matches!(f, CheckOutputFormat::Csv)),
+        ] as [(&str, fn(&CheckOutputFormat) -> bool); 3]
+        {
+            let cli = Cli::try_parse_from(["mixrand", "check", "--output-format", arg]).unwrap();
+            match cli.command {
+                Some(Command::Check(a)) => assert!(matcher(&a.output_format)),
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_comma_separated_sources() {
+        let cli = Cli::try_parse_from(["mixrand", "check", "--sources", "hwrng,cpurng,fallback"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Check(args)) => {
+                let s = args.sources.unwrap();
+                assert_eq!(s, vec!["hwrng", "cpurng", "fallback"]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_completions_subcommand() {
+        let cli = Cli::try_parse_from(["mixrand", "completions", "bash"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Completions(_))));
+    }
+
+    #[test]
+    fn test_completions_rejects_invalid_shell() {
+        let result = Cli::try_parse_from(["mixrand", "completions", "cmd"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_sources_subcommand() {
+        let cli = Cli::try_parse_from(["mixrand", "list-sources"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::ListSources(_))));
+    }
+
+    #[test]
+    fn test_bytes_zero_accepted_by_parser() {
+        // Parser does not reject 0; main.rs enforces the minimum at runtime.
+        let cli = Cli::try_parse_from(["mixrand", "-n", "0"]).unwrap();
+        assert_eq!(cli.bytes, 0);
+    }
+
+    #[test]
+    fn test_args_conflict_with_subcommand() {
+        // With args_conflicts_with_subcommands, providing main-level args alongside
+        // a subcommand must fail.
+        let result = Cli::try_parse_from(["mixrand", "-n", "32", "daemon"]);
+        assert!(result.is_err());
     }
 }

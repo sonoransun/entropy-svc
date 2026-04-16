@@ -1,24 +1,12 @@
-mod check;
-mod cli;
-mod config;
-mod csprng;
-mod daemon;
-mod entropy;
-mod error;
-mod health;
-mod logging;
-mod memlock;
-mod mixer;
-mod output;
-mod stats;
-
 use std::path::Path;
 use std::process;
 
 use clap::Parser;
 
-use cli::{Cli, Command, CpuRngArgs, HsmArgs};
-use config::Config;
+use mixrand::cli::{self, Cli, Command, CpuRngArgs, HsmArgs};
+use mixrand::config::{self, Config};
+use mixrand::sensitive::SensitiveBytes;
+use mixrand::{bench, check, daemon, entropy, logging, output};
 
 /// Build a full Config by layering: defaults -> TOML file -> env vars -> CLI overrides.
 fn build_config(
@@ -112,6 +100,21 @@ fn build_config(
     if let Some(ref v) = hsm_args.tpm2_device {
         hsm.tpm2.tcti = Some(format!("device:{}", v));
     }
+    if let Some(ref v) = hsm_args.pkcs11_pin {
+        hsm.pkcs11.pin = Some(v.clone());
+    }
+    if let Some(ref v) = hsm_args.yubihsm_password {
+        hsm.yubihsm.password = Some(v.clone());
+    }
+
+    if hsm_args.has_cli_secret() {
+        let names = hsm_args.cli_secret_names().join(", ");
+        log::warn!(
+            "security: secret passed on CLI ({}) — visible to other users via `ps` / /proc/<pid>/cmdline. \
+             Use the MIXRAND_* env var equivalent instead.",
+            names
+        );
+    }
 
     let cpu_warnings = full_cfg.cpu_rng.validate();
     for w in cpu_warnings {
@@ -138,7 +141,8 @@ fn run_generate(cli: &Cli, config: &Config) {
     if cli.bytes > MAX_BYTES {
         log::error!(
             "byte count {} exceeds maximum {} (100 MiB)",
-            cli.bytes, MAX_BYTES
+            cli.bytes,
+            MAX_BYTES
         );
         process::exit(1);
     }
@@ -153,10 +157,12 @@ fn run_generate(cli: &Cli, config: &Config) {
         match entropy::generate(cli.bytes, config) {
             Ok(result) => {
                 log::info!("entropy source: {}", result.source);
-                let mut bytes = result.bytes;
+                // Wrap the CSPRNG output so Drop zeroizes even if
+                // output::write_output panics or returns early.
+                let bytes = SensitiveBytes::new(result.bytes);
                 let write_result =
                     output::write_output(&bytes, &cli.format, cli.output_file.as_deref());
-                entropy::cpurng::zeroize_vec(&mut bytes);
+                drop(bytes); // explicit zeroize point before error handling
                 if let Err(e) = write_result {
                     log::error!("error writing output: {}", e);
                     process::exit(1);
@@ -191,7 +197,11 @@ fn run_list_sources(config: &Config) {
     }
 }
 
-fn effective_log_level(cli_log: &logging::LogArgs, verbose: bool, quiet: bool) -> Option<logging::LogLevel> {
+fn effective_log_level(
+    cli_log: &logging::LogArgs,
+    verbose: bool,
+    quiet: bool,
+) -> Option<logging::LogLevel> {
     if verbose {
         Some(logging::LogLevel::Debug)
     } else if quiet {
@@ -201,7 +211,28 @@ fn effective_log_level(cli_log: &logging::LogArgs, verbose: bool, quiet: bool) -
     }
 }
 
+/// If the invocation is `mixrand --version --verbose` (flags in any order),
+/// print the verbose build-provenance block and exit(0). Clap would
+/// otherwise intercept `--version` and print just the Cargo package version.
+fn maybe_print_verbose_version() {
+    let mut saw_version = false;
+    let mut saw_verbose = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" => saw_version = true,
+            "--verbose" | "-v" => saw_verbose = true,
+            "--" => break, // stop at argument separator
+            _ => {}
+        }
+    }
+    if saw_version && saw_verbose {
+        mixrand::version_info::print_verbose();
+        process::exit(0);
+    }
+}
+
 fn main() {
+    maybe_print_verbose_version();
     let cli = Cli::parse();
 
     match &cli.command {
@@ -214,8 +245,7 @@ fn main() {
                 log_args.log_level = Some(logging::LogLevel::Info);
             }
             logging::init(&log_args, true);
-            let config =
-                build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
+            let config = build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
             if let Err(e) = daemon::run(args, &config) {
                 log::error!("{}", e);
                 process::exit(1);
@@ -223,28 +253,38 @@ fn main() {
         }
         Some(Command::Check(args)) => {
             logging::init(&args.log, false);
-            let config =
-                build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
+            let config = build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
             if let Err(e) = check::run(args, &config) {
+                log::error!("{}", e);
+                process::exit(1);
+            }
+        }
+        Some(Command::Bench(args)) => {
+            logging::init(&args.log, false);
+            let config = build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
+            if let Err(e) = bench::run(args, &config) {
                 log::error!("{}", e);
                 process::exit(1);
             }
         }
         Some(Command::ListSources(args)) => {
             logging::init(&args.log, false);
-            let config =
-                build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
+            let config = build_config(args.config_file.as_deref(), &args.cpu_rng, &args.hsm);
             run_list_sources(&config);
         }
         None => {
             let mut log_args = cli.log.clone();
             log_args.log_level = effective_log_level(&cli.log, cli.verbose, cli.quiet);
             logging::init(&log_args, false);
-            let config =
-                build_config(cli.config_file.as_deref(), &cli.cpu_rng, &cli.hsm);
+            let config = build_config(cli.config_file.as_deref(), &cli.cpu_rng, &cli.hsm);
 
             if cli.show_config {
-                println!("{}", toml::to_string_pretty(&config.cpu_rng).unwrap_or_else(|_| format!("{:?}", config.cpu_rng)));
+                // Full effective config as round-trippable TOML (sensitive
+                // fields like PINs and passwords are omitted via
+                // `#[serde(skip_serializing)]`).
+                let rendered =
+                    toml::to_string_pretty(&config).unwrap_or_else(|_| format!("{:#?}", config));
+                println!("{}", rendered);
                 return;
             }
 
@@ -256,7 +296,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::CpuRngConfig;
+    use mixrand::config::CpuRngConfig;
 
     fn default_log_args() -> logging::LogArgs {
         logging::LogArgs {
@@ -297,6 +337,8 @@ mod tests {
             enable_sgx: None,
             pkcs11_library: None,
             tpm2_device: None,
+            pkcs11_pin: None,
+            yubihsm_password: None,
         }
     }
 
@@ -375,6 +417,9 @@ mod tests {
         hsm.pkcs11_library = Some("/usr/lib/test.so".into());
         let cfg = build_config(None, &args, &hsm);
         assert!(!cfg.hsm.tpm2.enabled);
-        assert_eq!(cfg.hsm.pkcs11.library_path.as_deref(), Some("/usr/lib/test.so"));
+        assert_eq!(
+            cfg.hsm.pkcs11.library_path.as_deref(),
+            Some("/usr/lib/test.so")
+        );
     }
 }

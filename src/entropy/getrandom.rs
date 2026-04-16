@@ -45,9 +45,7 @@ fn sys_getrandom(buf: &mut [u8]) -> Result<(), Error> {
 fn sys_getrandom(buf: &mut [u8]) -> Result<(), Error> {
     // getentropy(3) is limited to 256 bytes per call on macOS
     for chunk in buf.chunks_mut(256) {
-        let ret = unsafe {
-            libc::getentropy(chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
-        };
+        let ret = unsafe { libc::getentropy(chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
         if ret != 0 {
             return Err(Error::NoEntropy(format!(
                 "getentropy() failed: {}",

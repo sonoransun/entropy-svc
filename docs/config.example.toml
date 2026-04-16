@@ -1,0 +1,104 @@
+# Example mixrand configuration file.
+#
+# Default install path: /etc/mixrand.toml (override with --config /path/to.toml).
+# Every field is optional; unset fields fall back to the built-in defaults.
+# CLI flags and MIXRAND_* environment variables override values set here.
+#
+# Sensitive fields (PKCS#11 PIN, YubiHSM password) are NOT loaded from this
+# file — set them via MIXRAND_PKCS11_PIN / MIXRAND_YUBIHSM_PASSWORD env
+# vars only. The `#[serde(skip_serializing)]` attribute on those fields
+# also means `mixrand --show-config` will never print them back.
+
+# ---------------------------------------------------------------------------
+# [cpu_rng] — CPU hardware RNG configuration
+# ---------------------------------------------------------------------------
+[cpu_rng]
+# Enable each CPU RNG instruction. If the CPU lacks the instruction, the
+# source reports unavailable and is skipped — no need to disable manually.
+enable_rdseed = true              # x86_64 RDSEED
+enable_rdrand = true              # x86_64 RDRAND
+enable_xstore = true              # VIA PadLock XSTORE
+enable_rndr   = true              # AArch64 RNDR
+enable_rndrrs = true              # AArch64 RNDRRS
+
+# Per-instruction retry budget. Range: 1–100. Higher values tolerate
+# occasional instruction failures (e.g. RDRAND carry=0) at the cost of
+# latency.
+rdrand_retries = 10
+rdseed_retries = 10
+rndr_retries   = 10
+rndrrs_retries = 10
+
+# XSTORE quality factor. Range: 0–3 (higher = more conditioning).
+xstore_quality = 3
+
+# Preferred instruction when the standalone CPU RNG source is used.
+# Values: "rdseed" | "rdrand" | "xstore" | "rndr" | "rndrrs"
+prefer = "rdseed"
+
+# Bytes of CPU-RNG output mixed into the fallback cascade. Range: 8–1024.
+fallback_mix_bytes = 32
+
+# Oversample ratio for the standalone CPU RNG source (entropy is
+# over-collected then condensed through the mixer). Range: 1–16.
+oversample = 2
+
+# Mixer mode. "blake2b" is the default single-pass mixer. "hkdf" is the
+# two-stage extract-then-expand variant for low-entropy-density inputs.
+mixer_mode = "blake2b"
+
+# ---------------------------------------------------------------------------
+# [hsm] — HSM / secure-element configuration
+# ---------------------------------------------------------------------------
+# Each sub-section is only active if mixrand was built with the matching
+# Cargo feature: --features tpm2, pkcs11, pcsc, yubikey, gnupg,
+# yubihsm-native, or sgx (or the umbrella --features hsm / all-sources).
+
+[hsm.tpm2]
+enabled = true
+# TCTI string for the TPM2 TSS stack. Default (None at runtime) expands to
+# "device:/dev/tpmrm0". Examples:
+#   device:/dev/tpm0
+#   mssim:host=localhost,port=2321
+#   swtpm:path=/tmp/swtpm-sock
+# tcti = "device:/dev/tpmrm0"
+
+[hsm.pkcs11]
+enabled = true
+# Path to the PKCS#11 library (dlopen'd at runtime).
+# library_path = "/usr/lib/softhsm/libsofthsm2.so"
+# Optional slot ID (u64). If unset, the first available slot is used.
+# slot_id = 0
+# PIN: set via MIXRAND_PKCS11_PIN env var, never in this file.
+
+[hsm.pcsc]
+enabled = true
+# Substring filter for reader name (exact match if left unset).
+# reader = "Yubico"
+# Maximum bytes per GET CHALLENGE APDU (1–255). 32 is safe for most cards.
+max_le = 32
+
+[hsm.yubikey]
+enabled = true
+# Filter by YubiKey serial (u32). Unset = any YubiKey.
+# serial = 12345678
+
+[hsm.gnupg]
+enabled = true
+# Override gpg binary path. Default: system PATH.
+# gpg_path = "/usr/bin/gpg"
+# quality_level: 0 (insecure) to 2 (strong). Range: 0–2.
+quality_level = 2
+
+[hsm.yubihsm]
+enabled = true
+# HTTP connector URL. Default (None) = http://127.0.0.1:12345.
+# connector_url = "http://localhost:12345"
+# Auth key ID (u16). Range: 1–65535.
+auth_key_id = 1
+# Password: set via MIXRAND_YUBIHSM_PASSWORD env var, never in this file.
+
+[hsm.sgx]
+enabled = true
+# Path to the signed SGX enclave shared object.
+# enclave_path = "/usr/libexec/mixrand/mixrand_entropy_enclave.signed.so"

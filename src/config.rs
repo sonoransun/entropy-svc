@@ -23,7 +23,6 @@ pub enum MixerMode {
     Hkdf,
 }
 
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CpuRngConfig {
@@ -114,13 +113,7 @@ impl CpuRngConfig {
             3,
             &mut warnings,
         );
-        clamp_warn(
-            "oversample",
-            &mut self.oversample,
-            1,
-            16,
-            &mut warnings,
-        );
+        clamp_warn("oversample", &mut self.oversample, 1, 16, &mut warnings);
 
         if self.fallback_mix_bytes == 0 {
             warnings.push("fallback_mix_bytes clamped from 0 to 8 (minimum)".into());
@@ -415,7 +408,7 @@ pub fn apply_hsm_env_overrides(cfg: &mut HsmConfig) {
 // Top-level config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub cpu_rng: CpuRngConfig,
@@ -786,5 +779,103 @@ prefer = "rdrand"
         };
         let warnings = cfg.validate();
         assert!(warnings.is_empty());
+    }
+
+    // --- Load-config edge cases ---
+
+    #[test]
+    fn test_load_config_malformed_toml_returns_error_not_panic() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("mixrand_malformed.toml");
+        let mut f = std::fs::File::create(&path).expect("test setup: File::create");
+        f.write_all(b"this is [ not = valid toml\n")
+            .expect("test setup: write_all");
+        let result = load_config(Some(&path));
+        let _ = std::fs::remove_file(&path);
+        match result {
+            Err(Error::InvalidArgs(msg)) => {
+                assert!(msg.contains("failed to parse"), "msg was: {msg}");
+            }
+            other => panic!("expected InvalidArgs parse error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_load_config_nonexistent_explicit_path_errors() {
+        let result = load_config(Some(Path::new("/nonexistent/mixrand-never.toml")));
+        match result {
+            Err(Error::InvalidArgs(msg)) => {
+                assert!(msg.contains("not found"), "msg was: {msg}");
+            }
+            other => panic!("expected InvalidArgs not-found, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_load_config_no_path_no_default_returns_default() {
+        // With /etc/mixrand.toml absent on test hosts this returns defaults.
+        // On a host that DOES have /etc/mixrand.toml we instead validate
+        // that the result loads successfully.
+        let out = load_config(None);
+        assert!(out.is_ok(), "load_config(None) returned: {:?}", out);
+    }
+
+    #[test]
+    fn test_validate_is_idempotent_for_clamped_values() {
+        // First validate clamps; second validate sees valid values and
+        // emits no new warnings.
+        let mut cfg = CpuRngConfig {
+            rdrand_retries: 1_000_000, // out of range -> clamp
+            rdseed_retries: 0,         // out of range -> clamp
+            oversample: 0,             // out of range -> clamp
+            ..Default::default()
+        };
+        let warnings_first = cfg.validate();
+        assert!(
+            !warnings_first.is_empty(),
+            "first validate should emit clamp warnings"
+        );
+        let warnings_second = cfg.validate();
+        assert!(
+            warnings_second.is_empty(),
+            "idempotent validate should produce no warnings, got: {warnings_second:?}"
+        );
+    }
+
+    #[test]
+    fn test_apply_env_overrides_invalid_numeric_is_ignored() {
+        // Parse failure leaves the field untouched — no panic.
+        std::env::set_var("MIXRAND_RDRAND_RETRIES", "not-a-number");
+        let mut cfg = CpuRngConfig {
+            rdrand_retries: 7,
+            ..Default::default()
+        };
+        apply_env_overrides(&mut cfg);
+        assert_eq!(cfg.rdrand_retries, 7, "invalid env should be ignored");
+        std::env::remove_var("MIXRAND_RDRAND_RETRIES");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_bool_variants() {
+        for (val, expected) in [
+            ("true", true),
+            ("1", true),
+            ("yes", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+        ] {
+            std::env::set_var("MIXRAND_ENABLE_RDRAND", val);
+            let mut cfg = CpuRngConfig::default();
+            apply_env_overrides(&mut cfg);
+            assert_eq!(cfg.enable_rdrand, expected, "val={val}");
+        }
+        // Unknown value leaves the config untouched (stays default).
+        std::env::set_var("MIXRAND_ENABLE_RDRAND", "maybe");
+        let mut cfg = CpuRngConfig::default();
+        let before = cfg.enable_rdrand;
+        apply_env_overrides(&mut cfg);
+        assert_eq!(cfg.enable_rdrand, before);
+        std::env::remove_var("MIXRAND_ENABLE_RDRAND");
     }
 }

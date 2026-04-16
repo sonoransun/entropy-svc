@@ -23,11 +23,7 @@ impl YubiHsmSource {
                 .unwrap_or("http://127.0.0.1:12345")
                 .to_string(),
             auth_key_id: config.auth_key_id,
-            password: config
-                .password
-                .as_deref()
-                .unwrap_or("password")
-                .to_string(),
+            password: config.password.as_deref().unwrap_or("password").to_string(),
         }
     }
 }
@@ -71,22 +67,18 @@ impl EntropySource for YubiHsmSource {
     }
 
     fn collect(&self, count: usize) -> Result<Vec<u8>, Error> {
-        let connector =
-            yubihsm::connector::HttpConnector::new(&self.connector_url).map_err(|e| {
-                Error::NoEntropy(format!("YubiHSM connector creation failed: {}", e))
-            })?;
+        let connector = yubihsm::connector::HttpConnector::new(&self.connector_url)
+            .map_err(|e| Error::NoEntropy(format!("YubiHSM connector creation failed: {}", e)))?;
 
         let credentials =
             yubihsm::Credentials::from_password(self.auth_key_id, self.password.as_bytes());
 
-        let client =
-            yubihsm::Client::open(connector, credentials, true).map_err(|e| {
-                Error::NoEntropy(format!("YubiHSM client open failed: {}", e))
-            })?;
+        let client = yubihsm::Client::open(connector, credentials, true)
+            .map_err(|e| Error::NoEntropy(format!("YubiHSM client open failed: {}", e)))?;
 
-        let bytes = client.get_pseudo_random(count).map_err(|e| {
-            Error::NoEntropy(format!("YubiHSM get_pseudo_random failed: {}", e))
-        })?;
+        let bytes = client
+            .get_pseudo_random(count)
+            .map_err(|e| Error::NoEntropy(format!("YubiHSM get_pseudo_random failed: {}", e)))?;
 
         Ok(bytes)
     }

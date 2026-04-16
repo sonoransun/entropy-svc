@@ -1,13 +1,27 @@
+//! Output encoding for generated random bytes.
+//!
+//! [`write_output`] dispatches on the [`OutputFormat`] variant chosen by the
+//! caller (from CLI `-f`/`--format`) and writes to either a file path or
+//! stdout. Formats cover common operational needs — copy-paste-friendly hex
+//! and base64 for humans, raw bytes for piping into `dd`/files, text for
+//! printable-ASCII passwords, and octal/binary/uuencode for interoperating
+//! with other tooling.
+
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
 
 use crate::cli::OutputFormat;
 
-/// Writes the random bytes to stdout or a file in the specified format.
+/// Writes `bytes` to stdout or a file in the specified `format`.
+///
+/// When `output_file` is `Some`, the encoded output is buffered to the file
+/// and flushed before return. When `None`, output goes to locked stdout.
+///
+/// Returns any I/O error encountered during encoding or flushing.
 pub fn write_output(
     bytes: &[u8],
     format: &OutputFormat,
@@ -231,5 +245,91 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         // Second line (index 1) is the encoded data line; length char = 45 + 32 = 77 = 'M'
         assert!(lines[1].starts_with('M'));
+    }
+
+    // --- Round-trip properties ---
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let s = s.trim();
+        assert_eq!(s.len() % 2, 0, "hex string must be even-length");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
+            .collect()
+    }
+
+    #[test]
+    fn property_hex_roundtrip_all_byte_values() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let s = format_to_string(&data, &OutputFormat::Hex);
+        assert_eq!(unhex(&s), data);
+    }
+
+    #[test]
+    fn property_hex_upper_roundtrip_all_byte_values() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let s = format_to_string(&data, &OutputFormat::HexUpper);
+        assert_eq!(unhex(&s), data);
+        assert!(s
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn property_base64_roundtrip_all_byte_values() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let data: Vec<u8> = (0u8..=255).collect();
+        let encoded = format_to_string(&data, &OutputFormat::Base64);
+        let decoded = STANDARD.decode(encoded.trim()).expect("base64 decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn property_base64url_roundtrip_all_byte_values() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let data: Vec<u8> = (0u8..=255).collect();
+        let encoded = format_to_string(&data, &OutputFormat::Base64url);
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded.trim())
+            .expect("base64url decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn property_octal_roundtrip_all_byte_values() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let encoded = format_to_string(&data, &OutputFormat::Octal);
+        // Format: "ooo ooo ooo\n" — parse by splitting on spaces.
+        let parsed: Vec<u8> = encoded
+            .trim()
+            .split_whitespace()
+            .map(|s| u8::from_str_radix(s, 8).expect("octal digit"))
+            .collect();
+        assert_eq!(parsed, data);
+    }
+
+    #[test]
+    fn property_binary_roundtrip_all_byte_values() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let encoded = format_to_string(&data, &OutputFormat::Binary);
+        let parsed: Vec<u8> = encoded
+            .trim()
+            .split_whitespace()
+            .map(|s| u8::from_str_radix(s, 2).expect("binary digit"))
+            .collect();
+        assert_eq!(parsed, data);
+    }
+
+    #[test]
+    fn test_hex_lower_is_all_lowercase() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let s = format_to_string(&data, &OutputFormat::Hex);
+        assert!(s
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

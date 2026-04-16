@@ -1,0 +1,273 @@
+.TH MIXRAND 1 "2026" "mixrand 0.1.0" "User Commands"
+.SH NAME
+mixrand \- secure random byte generator with multi-source entropy mixing
+.SH SYNOPSIS
+.B mixrand
+[\fIOPTIONS\fR]
+.br
+.B mixrand
+\fIdaemon\fR [\fIOPTIONS\fR]
+.br
+.B mixrand
+\fIcheck\fR [\fIOPTIONS\fR]
+.br
+.B mixrand
+\fIbench\fR [\fIOPTIONS\fR]
+.br
+.B mixrand
+\fIlist-sources\fR [\fIOPTIONS\fR]
+.br
+.B mixrand
+\fIcompletions\fR \fISHELL\fR
+.SH DESCRIPTION
+.B mixrand
+generates secure random bytes by cryptographically mixing multiple
+independent entropy sources \(em hardware RNGs, CPU instructions
+(RDRAND/RDSEED/RNDR), the Linux kernel pool, and optional HSM or
+secure\-element sources. Inputs are combined via BLAKE2b\-256 (or HKDF)
+with domain separation and length\-prefixed framing, seeded into a
+ChaCha20 CSPRNG. NIST SP 800\-90B continuous health tests (Repetition
+Count + Adaptive Proportion) reject stuck or biased sources before they
+reach the mixer.
+.SH OPTIONS (GENERATE MODE)
+.TP
+\fB\-n\fR, \fB\-\-bytes\fR \fIN\fR
+Number of random bytes to generate. Default 32, maximum 100 MiB.
+.TP
+\fB\-f\fR, \fB\-\-format\fR \fIFMT\fR
+Output format: \fBhex\fR (default), \fBhex\-upper\fR, \fBraw\fR,
+\fBbase64\fR, \fBbase64url\fR, \fBuuencode\fR, \fBtext\fR, \fBoctal\fR,
+\fBbinary\fR.
+.TP
+\fB\-o\fR, \fB\-\-output\-file\fR \fIPATH\fR
+Write output to \fIPATH\fR instead of stdout.
+.TP
+\fB\-\-count\fR \fIN\fR
+Generate \fIN\fR independent outputs (up to 10000).
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug\-level logging.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Error\-level logging only (mutually exclusive with
+.BR \-v ).
+.TP
+\fB\-\-show\-config\fR
+Print the effective configuration as TOML and exit.
+.TP
+\fB\-\-config\fR \fIPATH\fR
+Configuration file path (default
+.IR /etc/mixrand.toml ).
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print the version and exit.
+.TP
+\fB\-V\fR \fB\-v\fR, \fB\-\-version \-\-verbose\fR
+Print extended build provenance (git commit, UTC build timestamp,
+.BR rustc (1)
+version, target triple, enabled Cargo features) and exit.
+.SH SUBCOMMAND: daemon
+Linux\-only. Monitors
+.I /proc/sys/kernel/random/entropy_avail
+and injects mixed entropy via
+.BR ioctl (2)
+.B RNDADDENTROPY
+when it falls below \fB\-\-threshold\fR.
+.TP
+\fB\-t\fR, \fB\-\-threshold\fR \fIBITS\fR
+Entropy bits threshold below which to inject (default 256).
+.TP
+\fB\-i\fR, \fB\-\-interval\fR \fISECS\fR
+Poll interval in seconds (default 5).
+.TP
+\fB\-b\fR, \fB\-\-batch\-size\fR \fIBYTES\fR
+Bytes to inject per round (default 64).
+.TP
+\fB\-c\fR, \fB\-\-credit\-ratio\fR \fIBITS\fR
+Bits of entropy credited per byte, 1\(en8 (default 4).
+.TP
+\fB\-\-user\fR \fINAME\fR
+Drop privileges to this user after opening
+.IR /dev/random .
+.TP
+\fB\-\-pid\-file\fR \fIPATH\fR
+Write PID to \fIPATH\fR; detects stale PID files on startup and uses
+\fBO_CREAT|O_EXCL\fR to prevent two daemons from racing the same file.
+.TP
+\fB\-\-no\-self\-test\fR
+Skip the startup self\-test (debug only). By default the daemon probes
+every built source and runs NIST SP 800\-90B health tests on a 256\-byte
+sample before signalling systemd
+.BR READY=1 ;
+if every source fails, the daemon exits non\-zero instead of entering
+the main loop.
+.SH SIGNALS
+The daemon installs handlers for:
+.TP
+.B SIGTERM, SIGINT
+Graceful shutdown. The PID file is removed before the daemon exits.
+.TP
+.B SIGHUP
+Reload
+.I /etc/mixrand.toml
+(or the path passed to
+.BR \-\-config ).
+Does not reopen
+.IR /dev/random ,
+re\-probe source plugins, or re\-run the startup self\-test \(em
+restart the service for those.
+.SH SUBCOMMAND: check
+Run FIPS 140\-2 statistical tests and entropy estimates against each
+entropy source.
+.TP
+\fB\-d\fR, \fB\-\-duration\fR \fISPEC\fR
+Duration (e.g.
+.BR 30s ", " 5m ", " 1h ", " 2d ";
+bare number = minutes). Default 1m.
+.TP
+\fB\-s\fR, \fB\-\-sample\-size\fR \fIBYTES\fR
+Bytes per sample (FIPS tests need >=2500). Default 2500.
+.TP
+\fB\-\-sources\fR \fINAME,NAME,...\fR
+Limit to the listed sources (comma\-separated, case\-insensitive).
+.TP
+\fB\-\-output\-format\fR \fIFMT\fR
+Output format: \fBtext\fR (default), \fBjson\fR, \fBcsv\fR.
+.SH SUBCOMMAND: bench
+Measure per\-source throughput (bytes/s, samples/s) over a fixed
+duration. Unlike
+.BR check ,
+does not run statistical tests.
+.TP
+\fB\-d\fR, \fB\-\-duration\fR \fISPEC\fR
+Per\-source benchmark duration (default 3s).
+.TP
+\fB\-s\fR, \fB\-\-sample\-size\fR \fIBYTES\fR
+Bytes per
+.BR collect (3)
+call (default 4096).
+.TP
+\fB\-\-max\-bytes\fR \fIN\fR
+Stop a source once it has produced \fIN\fR bytes, even if the
+duration budget remains.
+.TP
+\fB\-\-output\-format\fR \fIFMT\fR
+Output format: \fBtext\fR (default), \fBjson\fR, \fBcsv\fR.
+.SH SUBCOMMAND: list-sources
+Probe every configured entropy source and print its availability, type,
+and description.
+.SH SUBCOMMAND: completions
+Emit shell completion scripts.
+.I SHELL
+is one of
+.BR bash ", " zsh ", " fish ", " elvish ", " powershell .
+.SH ENVIRONMENT
+Configuration layers merge in the order:
+defaults \(-> /etc/mixrand.toml (or \-\-config) \(-> MIXRAND_* env vars
+\(-> CLI flags. Later layers override earlier ones.
+.PP
+Common environment variables:
+.TP
+.B MIXRAND_ENABLE_RDSEED
+true|false \(em toggle RDSEED instruction.
+.TP
+.B MIXRAND_PREFER
+rdseed|rdrand|xstore|rndr|rndrrs.
+.TP
+.B MIXRAND_MIXER_MODE
+blake2b|hkdf.
+.TP
+.B MIXRAND_TPM2_TCTI
+TCTI string for TPM 2.0 (e.g. device:/dev/tpmrm0).
+.TP
+.B MIXRAND_PKCS11_PIN
+PKCS#11 user PIN \(em always prefer this over
+.BR \-\-pkcs11\-pin .
+.TP
+.B MIXRAND_YUBIHSM_PASSWORD
+YubiHSM authentication password \(em always prefer this over
+.BR \-\-yubihsm\-password .
+.PP
+See the full list in
+.IR docs/config.example.toml .
+.SH EXAMPLES
+Generate 32 random hex bytes:
+.PP
+.RS
+.B mixrand
+.RE
+.PP
+Generate a printable 24\-character password:
+.PP
+.RS
+.B "mixrand -n 24 -f text"
+.RE
+.PP
+Dump 1 MiB of raw random bytes to a file:
+.PP
+.RS
+.B "mixrand -n 1048576 -f raw -o /tmp/keydata.bin"
+.RE
+.PP
+Run statistical tests for 30 seconds and emit JSON:
+.PP
+.RS
+.B "mixrand check -d 30s --output-format json"
+.RE
+.PP
+Benchmark throughput of every source:
+.PP
+.RS
+.B "mixrand bench -d 5s --output-format csv"
+.RE
+.PP
+Run as an entropy daemon on Linux, dropping to an unprivileged user:
+.PP
+.RS
+.B "mixrand daemon --user _entropy --pid-file /run/mixrand.pid"
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Entropy collection failed, I/O error, or runtime error.
+.TP
+.B 2
+No entropy sources are available or every source failed the startup
+self\-test.
+.TP
+.B 64
+Invalid argument or unknown flag (maps to sysexits(3)
+.BR EX_USAGE ).
+.SH FILES
+.TP
+.I /etc/mixrand.toml
+Default configuration file path (optional).
+.TP
+.I /dev/hwrng
+Hardware RNG character device (Linux).
+.TP
+.I /dev/random
+Kernel blocking entropy pool (Linux; daemon mode writes here).
+.TP
+.I /run/mixrand/mixrand.pid
+Default PID file for the daemon when used with the shipped systemd unit.
+.TP
+.I /etc/systemd/system/mixrand.service
+Shipped systemd unit; see
+.IR deploy/systemd/mixrand.service
+in the source tree.
+.TP
+.I /usr/lib/tmpfiles.d/mixrand.conf
+Creates the runtime directory on boot; see
+.IR deploy/systemd/mixrand.tmpfiles.d.conf .
+.SH SEE ALSO
+.BR getrandom (2),
+.BR random (4),
+.BR haveged (8),
+.BR tpm2_getrandom (1).
+.SH STANDARDS
+NIST SP 800\-90B (continuous health tests), FIPS 140\-2 (statistical
+tests), RFC 5869 (HKDF-style mixer), RFC 7539 (ChaCha20 CSPRNG).

@@ -18,11 +18,7 @@ pub struct GnuPGSource {
 impl GnuPGSource {
     pub fn new(config: &GnuPGConfig) -> Self {
         Self {
-            gpg_path: config
-                .gpg_path
-                .as_deref()
-                .unwrap_or("gpg")
-                .to_string(),
+            gpg_path: config.gpg_path.as_deref().unwrap_or("gpg").to_string(),
             quality: config.quality_level,
             available: AtomicU8::new(0),
         }

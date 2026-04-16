@@ -1,10 +1,36 @@
+//! Error type used across mixrand.
+//!
+//! A single sum type captures the three failure modes the rest of the crate
+//! wants to distinguish: operating-system I/O errors (wrapping
+//! [`std::io::Error`]), entropy-source unavailability, and invalid
+//! user-supplied arguments. Each variant carries enough detail for the
+//! message emitted via `Display` to be actionable (e.g. which source failed,
+//! which flag was invalid).
+//!
+//! A blanket `From<io::Error>` impl is provided so the common `?` patterns
+//! in entropy-source code just work.
+
 use std::fmt;
 use std::io;
 
+/// A unified error type for entropy collection, config parsing, and I/O.
+///
+/// # Examples
+///
+/// ```
+/// use mixrand::error::Error;
+/// let e = Error::NoEntropy("hwrng missing".into());
+/// assert!(format!("{}", e).contains("entropy error"));
+/// ```
 #[derive(Debug)]
 pub enum Error {
+    /// Underlying `std::io::Error` from a file read, poll, write, or similar.
     Io(io::Error),
+    /// An entropy source could not be read (device absent, empty, unhealthy,
+    /// hardware disabled, insufficient pool, etc.).
     NoEntropy(String),
+    /// User-supplied arguments (CLI flags, TOML config, env vars) were
+    /// invalid or unparseable.
     InvalidArgs(String),
 }
 

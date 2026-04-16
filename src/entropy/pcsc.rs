@@ -72,15 +72,10 @@ impl EntropySource for PcscSource {
         let reader = if let Some(ref filter) = self.reader_filter {
             readers
                 .iter()
-                .find(|r| {
-                    r.to_string_lossy().contains(filter.as_str())
-                })
+                .find(|r| r.to_string_lossy().contains(filter.as_str()))
                 .copied()
                 .ok_or_else(|| {
-                    Error::NoEntropy(format!(
-                        "PC/SC: no reader matching filter '{}'",
-                        filter
-                    ))
+                    Error::NoEntropy(format!("PC/SC: no reader matching filter '{}'", filter))
                 })?
         } else {
             readers[0]
@@ -103,9 +98,7 @@ impl EntropySource for PcscSource {
                 .map_err(|e| Error::NoEntropy(format!("PC/SC transmit failed: {}", e)))?;
 
             if resp.len() < 2 {
-                return Err(Error::NoEntropy(
-                    "PC/SC: response too short".into(),
-                ));
+                return Err(Error::NoEntropy("PC/SC: response too short".into()));
             }
 
             let sw1 = resp[resp.len() - 2];

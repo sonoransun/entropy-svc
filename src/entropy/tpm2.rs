@@ -23,11 +23,7 @@ pub struct Tpm2Source {
 impl Tpm2Source {
     pub fn new(config: &Tpm2Config) -> Self {
         Self {
-            tcti: config
-                .tcti
-                .as_deref()
-                .unwrap_or(DEFAULT_TCTI)
-                .to_string(),
+            tcti: config.tcti.as_deref().unwrap_or(DEFAULT_TCTI).to_string(),
         }
     }
 

@@ -27,11 +27,11 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use crate::entropy;
 #[cfg(target_os = "linux")]
-use crate::entropy::cpurng::zeroize_vec;
-#[cfg(target_os = "linux")]
 use crate::health::HealthTester;
 #[cfg(target_os = "linux")]
 use crate::memlock;
+#[cfg(target_os = "linux")]
+use crate::sensitive::SensitiveBytes;
 
 #[cfg(target_os = "linux")]
 const RNDADDENTROPY: libc::c_ulong = 0x40085203;
@@ -64,13 +64,15 @@ fn build_rand_pool_info(data: &[u8], entropy_bits: u32) -> Vec<u8> {
 
 #[cfg(target_os = "linux")]
 /// Inject entropy into the kernel pool via ioctl(RNDADDENTROPY).
-/// The ioctl buffer is zeroized after use regardless of success or failure.
+/// The ioctl envelope is wrapped in [`SensitiveBytes`] so its contents are
+/// zeroized when the function returns, regardless of success, failure, or
+/// panic between the ioctl and the Drop point.
 fn inject_entropy(dev_random: &File, data: &[u8], entropy_bits: u32) -> Result<(), Error> {
-    let mut buf = build_rand_pool_info(data, entropy_bits);
+    let buf = SensitiveBytes::new(build_rand_pool_info(data, entropy_bits));
     memlock::lock_and_protect(&buf);
     let ret = unsafe { libc::ioctl(dev_random.as_raw_fd(), RNDADDENTROPY, buf.as_ptr()) };
     memlock::munlock_slice(&buf);
-    zeroize_vec(&mut buf);
+    drop(buf); // explicit zeroize before error handling
     if ret < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -95,10 +97,7 @@ fn validate_permissions() -> Result<File, Error> {
         .map_err(|e| {
             Error::Io(std::io::Error::new(
                 e.kind(),
-                format!(
-                    "cannot open /dev/random for writing: {} (are you root?)",
-                    e
-                ),
+                format!("cannot open /dev/random for writing: {} (are you root?)", e),
             ))
         })
 }
@@ -110,9 +109,8 @@ fn validate_permissions() -> Result<File, Error> {
 fn drop_privileges(username: &str) -> Result<(), Error> {
     use std::ffi::CString;
 
-    let c_user = CString::new(username).map_err(|_| {
-        Error::InvalidArgs(format!("invalid username: {}", username))
-    })?;
+    let c_user = CString::new(username)
+        .map_err(|_| Error::InvalidArgs(format!("invalid username: {}", username)))?;
 
     let pw = unsafe { libc::getpwnam(c_user.as_ptr()) };
     if pw.is_null() {
@@ -154,30 +152,70 @@ fn drop_privileges(username: &str) -> Result<(), Error> {
 }
 
 #[cfg(target_os = "linux")]
-/// Write a PID file. Checks if an existing PID is alive via kill(pid, 0).
+/// Write a PID file using exclusive create (O_CREAT|O_EXCL).
 ///
-/// Note: This has an inherent TOCTOU race between checking the existing PID
-/// and writing the new one. This is standard for PID file implementations
-/// and is acceptable for daemon management (not security-critical).
+/// Sequence:
+///   1. Try `create_new(path)` — fails fast with `AlreadyExists` if a PID
+///      file is already present.
+///   2. On `AlreadyExists`, read the recorded PID. If it is live per
+///      `kill(pid, 0)`, refuse to start (another instance is running).
+///      Otherwise the file is stale — remove it and retry the exclusive
+///      create exactly once.
+///
+/// Exclusive create closes the narrow TOCTOU window between checking the
+/// recorded PID and writing our own. If two daemons race the stale-cleanup
+/// path, only the one whose `create_new` wins proceeds; the other sees
+/// `AlreadyExists` on the retry and exits with the proper error.
 fn write_pid_file(path: &Path) -> Result<(), Error> {
-    // Check if another instance is running
-    if path.exists() {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Ok(pid) = contents.trim().parse::<i32>() {
-                if unsafe { libc::kill(pid, 0) } == 0 {
-                    return Err(Error::InvalidArgs(format!(
-                        "another instance is running (pid {})",
-                        pid
-                    )));
-                }
-            }
-        }
-        // Stale PID file, remove it
-        let _ = fs::remove_file(path);
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fn try_create(path: &Path) -> std::io::Result<fs::File> {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(path)
     }
 
-    let pid = std::process::id();
-    fs::write(path, format!("{}\n", pid)).map_err(|e| {
+    let pid_text = format!("{}\n", std::process::id());
+
+    let mut file = match try_create(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Inspect the existing file's PID.
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    if unsafe { libc::kill(pid, 0) } == 0 {
+                        return Err(Error::InvalidArgs(format!(
+                            "another instance is running (pid {})",
+                            pid
+                        )));
+                    }
+                }
+            }
+            // Stale — best-effort remove, then retry exactly once.
+            let _ = fs::remove_file(path);
+            try_create(path).map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to create PID file {} after stale cleanup: {}",
+                        path.display(),
+                        e
+                    ),
+                ))
+            })?
+        }
+        Err(e) => {
+            return Err(Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to create PID file {}: {}", path.display(), e),
+            )));
+        }
+    };
+
+    file.write_all(pid_text.as_bytes()).map_err(|e| {
         Error::Io(std::io::Error::new(
             e.kind(),
             format!("failed to write PID file {}: {}", path.display(), e),
@@ -216,7 +254,7 @@ extern "C" fn reload_handler(_sig: libc::c_int) {
 fn install_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = shutdown_handler as libc::sighandler_t;
+        sa.sa_sigaction = shutdown_handler as *const () as libc::sighandler_t;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
@@ -224,7 +262,7 @@ fn install_signal_handlers() {
 
         // SIGHUP triggers config reload
         let mut sa_hup: libc::sigaction = std::mem::zeroed();
-        sa_hup.sa_sigaction = reload_handler as libc::sighandler_t;
+        sa_hup.sa_sigaction = reload_handler as *const () as libc::sighandler_t;
         sa_hup.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa_hup.sa_mask);
         libc::sigaction(libc::SIGHUP, &sa_hup, std::ptr::null_mut());
@@ -291,10 +329,74 @@ fn reload_config(config_path: Option<&Path>, full_config: &mut Config) {
     }
 }
 
+/// Outcome of a single source in a startup self-test.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum SelfTestOutcome {
+    /// Source produced bytes that passed RCT+APT health tests.
+    Ok { bytes_sampled: usize },
+    /// Source failed to collect (unavailable, error).
+    CollectError(String),
+    /// Source collected bytes but they failed RCT or APT.
+    HealthFailed,
+}
+
+/// Result of `self_test`: one entry per source plus a summary flag.
+#[cfg(target_os = "linux")]
+pub struct SelfTestReport {
+    pub per_source: Vec<(String, SelfTestOutcome)>,
+    pub all_failed: bool,
+    pub duration: Duration,
+}
+
+/// Probe every source in `sources`, collect `sample_size` bytes from each,
+/// and run a quick NIST SP 800-90B health pass on what comes back. Intended
+/// to run at daemon start so a systemd `Type=notify` service correctly
+/// marks start-up failure when no entropy source is usable.
+#[cfg(target_os = "linux")]
+pub fn self_test(
+    sources: &[Box<dyn crate::entropy::EntropySource>],
+    sample_size: usize,
+) -> SelfTestReport {
+    let start = Instant::now();
+    let mut per_source = Vec::with_capacity(sources.len());
+    let mut any_ok = false;
+
+    for source in sources {
+        let outcome = match source.collect(sample_size) {
+            Ok(bytes) => {
+                // Wrap so the sample is zeroized on drop.
+                let sample = SensitiveBytes::new(bytes);
+                if health_check_bytes(
+                    &sample,
+                    &mut HealthTester::new(crate::health::DEFAULT_MIN_ENTROPY_BITS),
+                ) {
+                    any_ok = true;
+                    SelfTestOutcome::Ok {
+                        bytes_sampled: sample.len(),
+                    }
+                } else {
+                    SelfTestOutcome::HealthFailed
+                }
+            }
+            Err(e) => SelfTestOutcome::CollectError(e.to_string()),
+        };
+        per_source.push((source.name().to_string(), outcome));
+    }
+
+    SelfTestReport {
+        per_source,
+        all_failed: !any_ok,
+        duration: start.elapsed(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn run(args: &DaemonArgs, config: &Config) -> Result<(), Error> {
     if args.batch_size == 0 {
-        return Err(Error::InvalidArgs("batch-size must be greater than 0".into()));
+        return Err(Error::InvalidArgs(
+            "batch-size must be greater than 0".into(),
+        ));
     }
 
     let dev_random = validate_permissions()?;
@@ -325,6 +427,46 @@ pub fn run(args: &DaemonArgs, config: &Config) -> Result<(), Error> {
     let config_path: Option<PathBuf> = args.config_file.clone();
     let mut full_config = config.clone();
 
+    // Startup self-test: probe every source and run health tests before
+    // telling systemd we're ready. Refuse to enter the main loop if every
+    // source is unusable.
+    if !args.no_self_test {
+        let sources = entropy::build_check_sources(&full_config);
+        let report = self_test(&sources, 256);
+        log::info!(
+            target: "mixrand::daemon",
+            "self-test completed in {}ms ({} sources probed)",
+            report.duration.as_millis(),
+            report.per_source.len(),
+        );
+        for (name, outcome) in &report.per_source {
+            match outcome {
+                SelfTestOutcome::Ok { bytes_sampled } => log::info!(
+                    target: "mixrand::daemon",
+                    "self-test: {} OK ({} bytes)", name, bytes_sampled,
+                ),
+                SelfTestOutcome::HealthFailed => log::warn!(
+                    target: "mixrand::daemon",
+                    "self-test: {} health-test failed", name,
+                ),
+                SelfTestOutcome::CollectError(e) => log::debug!(
+                    target: "mixrand::daemon",
+                    "self-test: {} unavailable: {}", name, e,
+                ),
+            }
+        }
+        if report.all_failed {
+            return Err(Error::NoEntropy(
+                "startup self-test: all entropy sources failed".into(),
+            ));
+        }
+    } else {
+        log::warn!(
+            target: "mixrand::daemon",
+            "startup self-test disabled via --no-self-test",
+        );
+    }
+
     log::info!(
         target: "mixrand::daemon",
         "started: threshold={}bits interval={}s batch={}B credit={}bits/byte",
@@ -338,6 +480,7 @@ pub fn run(args: &DaemonArgs, config: &Config) -> Result<(), Error> {
     let mut total_injections: u64 = 0;
     let mut total_bytes_injected: u64 = 0;
     let mut health_skips: u64 = 0;
+    let mut gen_errors: u64 = 0;
     let mut last_heartbeat = Instant::now();
     let heartbeat_interval = Duration::from_secs(300); // 5 minutes
     let mut last_sleep;
@@ -355,7 +498,7 @@ pub fn run(args: &DaemonArgs, config: &Config) -> Result<(), Error> {
                 if avail < args.threshold {
                     match entropy::generate(args.batch_size, &full_config) {
                         Ok(result) => {
-                            let mut data = result.bytes;
+                            let data = SensitiveBytes::new(result.bytes);
                             memlock::lock_and_protect(&data);
 
                             // Health check before injection
@@ -367,8 +510,10 @@ pub fn run(args: &DaemonArgs, config: &Config) -> Result<(), Error> {
                                 );
                                 health_skips += 1;
                                 memlock::munlock_slice(&data);
-                                zeroize_vec(&mut data);
-                                last_sleep = Duration::from_secs(1);
+                                drop(data);
+                                // `continue` jumps to loop head which
+                                // re-reads entropy_avail and re-assigns
+                                // last_sleep before the next sleep point.
                                 continue;
                             }
 
@@ -391,13 +536,14 @@ pub fn run(args: &DaemonArgs, config: &Config) -> Result<(), Error> {
                                 }
                             }
                             memlock::munlock_slice(&data);
-                            zeroize_vec(&mut data);
+                            // Drop of `data` zeroizes the buffer.
                         }
                         Err(e) => {
                             log::error!(
                                 target: "mixrand::daemon",
                                 "entropy generation failed: {}", e,
                             );
+                            gen_errors += 1;
                         }
                     }
 
@@ -426,9 +572,9 @@ pub fn run(args: &DaemonArgs, config: &Config) -> Result<(), Error> {
             let uptime = start.elapsed();
             log::info!(
                 target: "mixrand::daemon",
-                "heartbeat: uptime={}s injections={} total_bytes={} health_skips={} rct_failures={} apt_failures={}",
+                "heartbeat: uptime={}s injections={} total_bytes={} health_skips={} gen_errors={} rct_failures={} apt_failures={}",
                 uptime.as_secs(), total_injections, total_bytes_injected,
-                health_skips, health.rct_failures(), health.apt_failures(),
+                health_skips, gen_errors, health.rct_failures(), health.apt_failures(),
             );
             last_heartbeat = Instant::now();
         }
@@ -563,5 +709,164 @@ mod tests {
     fn test_adaptive_sleep_zero_threshold() {
         // threshold=0, threshold/2=0. avail(0) < 0 is false, so normal interval
         assert_eq!(adaptive_sleep(0, 0, 5), Duration::from_secs(5));
+    }
+
+    // --- Self-test unit tests ---
+
+    use crate::entropy::EntropySource;
+    use crate::error::Error;
+
+    struct GoodSource;
+    impl EntropySource for GoodSource {
+        fn name(&self) -> &str {
+            "good"
+        }
+        fn description(&self) -> &str {
+            "test: always succeeds with high entropy"
+        }
+        fn priority(&self) -> u32 {
+            1
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn collect(&self, count: usize) -> Result<Vec<u8>, Error> {
+            // Pseudo-random byte sequence that passes RCT/APT: use a simple LCG.
+            let mut out = Vec::with_capacity(count);
+            let mut x: u64 = 0xdead_beef_cafe_f00d;
+            for _ in 0..count {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                out.push((x >> 56) as u8);
+            }
+            Ok(out)
+        }
+    }
+
+    struct FailingSource;
+    impl EntropySource for FailingSource {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn description(&self) -> &str {
+            "test: always errors"
+        }
+        fn priority(&self) -> u32 {
+            2
+        }
+        fn is_available(&self) -> bool {
+            false
+        }
+        fn collect(&self, _count: usize) -> Result<Vec<u8>, Error> {
+            Err(Error::NoEntropy("test source deliberately fails".into()))
+        }
+    }
+
+    struct StuckSource;
+    impl EntropySource for StuckSource {
+        fn name(&self) -> &str {
+            "stuck"
+        }
+        fn description(&self) -> &str {
+            "test: returns all-zero (fails RCT)"
+        }
+        fn priority(&self) -> u32 {
+            3
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn collect(&self, count: usize) -> Result<Vec<u8>, Error> {
+            Ok(vec![0u8; count])
+        }
+    }
+
+    #[test]
+    fn test_self_test_all_failed_when_no_sources_healthy() {
+        let sources: Vec<Box<dyn EntropySource>> =
+            vec![Box::new(FailingSource), Box::new(StuckSource)];
+        let report = self_test(&sources, 256);
+        assert!(report.all_failed);
+        assert_eq!(report.per_source.len(), 2);
+        assert!(matches!(
+            report.per_source[0].1,
+            SelfTestOutcome::CollectError(_)
+        ));
+        assert!(matches!(
+            report.per_source[1].1,
+            SelfTestOutcome::HealthFailed
+        ));
+    }
+
+    #[test]
+    fn test_self_test_not_all_failed_if_any_source_ok() {
+        let sources: Vec<Box<dyn EntropySource>> =
+            vec![Box::new(FailingSource), Box::new(GoodSource)];
+        let report = self_test(&sources, 256);
+        assert!(!report.all_failed);
+        // Second entry must be the Ok one; the first must be CollectError.
+        assert!(matches!(
+            report.per_source[0].1,
+            SelfTestOutcome::CollectError(_)
+        ));
+        assert!(matches!(
+            report.per_source[1].1,
+            SelfTestOutcome::Ok { bytes_sampled: 256 }
+        ));
+    }
+
+    #[test]
+    fn test_self_test_empty_source_list_reports_all_failed() {
+        let sources: Vec<Box<dyn EntropySource>> = vec![];
+        let report = self_test(&sources, 256);
+        assert!(report.all_failed);
+        assert_eq!(report.per_source.len(), 0);
+    }
+
+    // --- PID file O_EXCL tests ---
+
+    #[test]
+    fn test_write_pid_file_creates_fresh() {
+        let tmp = std::env::temp_dir().join("mixrand_pid_fresh.pid");
+        let _ = fs::remove_file(&tmp);
+        write_pid_file(&tmp).expect("fresh PID file write");
+        let contents = fs::read_to_string(&tmp).expect("read");
+        let pid: i32 = contents.trim().parse().expect("parse");
+        assert_eq!(pid as u32, std::process::id());
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_write_pid_file_refuses_live_pid() {
+        let tmp = std::env::temp_dir().join("mixrand_pid_live.pid");
+        let _ = fs::remove_file(&tmp);
+        fs::write(&tmp, format!("{}\n", std::process::id())).expect("seed");
+        let err = write_pid_file(&tmp).unwrap_err();
+        match err {
+            Error::InvalidArgs(m) => {
+                assert!(m.contains("already running") || m.contains("another instance"))
+            }
+            other => panic!("expected InvalidArgs, got {:?}", other),
+        }
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_write_pid_file_cleans_stale() {
+        let tmp = std::env::temp_dir().join("mixrand_pid_stale.pid");
+        let _ = fs::remove_file(&tmp);
+        // PID 1 is always live, so use a very-high unlikely PID. Pick one that
+        // definitely is not alive by first scanning.
+        let mut dead_pid = 2_000_000;
+        while unsafe { libc::kill(dead_pid, 0) } == 0 && dead_pid < 4_000_000 {
+            dead_pid += 1;
+        }
+        fs::write(&tmp, format!("{}\n", dead_pid)).expect("seed");
+        write_pid_file(&tmp).expect("stale cleanup");
+        let contents = fs::read_to_string(&tmp).expect("read");
+        let pid: i32 = contents.trim().parse().expect("parse");
+        assert_eq!(pid as u32, std::process::id());
+        let _ = fs::remove_file(&tmp);
     }
 }
