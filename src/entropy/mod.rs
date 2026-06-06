@@ -3,6 +3,8 @@ pub mod fallback;
 pub mod getrandom;
 #[cfg(feature = "gnupg")]
 pub mod gnupg;
+#[cfg(feature = "gps")]
+pub mod gps;
 pub mod haveged;
 pub mod hwrng;
 pub mod jitter;
@@ -498,8 +500,71 @@ fn health_check(bytes: &[u8]) -> bool {
     true
 }
 
+/// Gather optional **public** "additional inputs" (NIST SP 800-90A
+/// personalization) to fold into generated output. These contribute **0
+/// credited entropy** and are never selectable entropy sources. Currently the
+/// only one is the GPS Subframe 4/Page 17 special-message field.
+///
+/// Acquisition is best-effort and bounded by a timeout inside the source; any
+/// failure is logged at debug and skipped. The entropy path never blocks on,
+/// nor fails because of, an additional input.
+#[allow(unused_variables)]
+fn gather_additional_inputs(config: &Config) -> Vec<(&'static str, Vec<u8>)> {
+    // `mut` is used only when an additional-input feature (e.g. `gps`) is built.
+    #[allow(unused_mut)]
+    let mut addins: Vec<(&'static str, Vec<u8>)> = Vec::new();
+
+    #[cfg(feature = "gps")]
+    if config.hsm.gps.enabled {
+        let src = gps::GpsSource::new(&config.hsm.gps);
+        if src.is_available() {
+            match src.collect(0) {
+                Ok(field) => addins.push(("gps-sf4p17", field)),
+                Err(e) => log::debug!("gps additional-input unavailable: {}", e),
+            }
+        }
+    }
+
+    addins
+}
+
+/// Fold public additional inputs into a strong primary by XOR-ing a public,
+/// deterministic keystream derived from those inputs (NIST SP 800-90A
+/// "additional input" treatment).
+///
+/// This is **entropy-neutral**: the mask is a function of public data only, so
+/// XOR-ing it into the primary cannot raise or lower the primary's entropy —
+/// the output is information-theoretically equivalent to the primary
+/// (recoverable as `output XOR mask`). It can therefore never let a public
+/// value masquerade as entropy, never weakens the primary below its own
+/// strength, and needs no reseeding (the mask is public, of any length).
+///
+/// Returns `primary` unchanged when there are no addins — so behavior is
+/// identical to the pre-existing path whenever GPS is disabled/unavailable.
+fn fold_additional_input(mut primary: Vec<u8>, addins: &[(&str, &[u8])]) -> Vec<u8> {
+    if addins.is_empty() || primary.is_empty() {
+        return primary;
+    }
+    // 32-byte key from the PUBLIC addins, expanded to a primary-length PUBLIC
+    // ChaCha20 keystream. mix_entropy zeroizes its digest; csprng::generate
+    // zeroizes the seed and RNG state.
+    let key = crate::mixer::mix_entropy(addins);
+    let mut mask = crate::csprng::generate(key, primary.len());
+    for (p, m) in primary.iter_mut().zip(mask.iter()) {
+        *p ^= *m;
+    }
+    cpurng::zeroize_vec(&mut mask);
+    primary
+}
+
 /// Attempts entropy sources in priority order, running a health check on each.
 /// Sources that fail collection or health testing are skipped.
+///
+/// After a strong source wins and passes the health check, any configured
+/// public additional inputs (e.g. the GPS Subframe 4/Page 17 field) are folded
+/// in via [`fold_additional_input`] — mixed but credited 0 entropy bits. The
+/// health check gates the *primary* (the real entropy); the fold is
+/// entropy-neutral.
 pub fn generate(count: usize, config: &Config) -> Result<EntropyResult, Error> {
     let sources = build_generate_sources(config);
 
@@ -512,9 +577,31 @@ pub fn generate(count: usize, config: &Config) -> Result<EntropyResult, Error> {
                     tried.push(format!("{}: health check failed", source.name()));
                     continue;
                 }
+
+                // Fold in public additional inputs (0-bit credit). Skipped for
+                // zero-length requests and whenever none are available.
+                let addins = if count > 0 {
+                    gather_additional_inputs(config)
+                } else {
+                    Vec::new()
+                };
+                if addins.is_empty() {
+                    return Ok(EntropyResult {
+                        bytes,
+                        source: source.description().into(),
+                    });
+                }
+                let refs: Vec<(&str, &[u8])> =
+                    addins.iter().map(|(l, d)| (*l, d.as_slice())).collect();
+                let labels: Vec<&str> = addins.iter().map(|(l, _)| *l).collect();
+                let folded = fold_additional_input(bytes, &refs);
                 return Ok(EntropyResult {
-                    bytes,
-                    source: source.description().into(),
+                    bytes: folded,
+                    source: format!(
+                        "{} + {} (0-bit addin)",
+                        source.description(),
+                        labels.join("+")
+                    ),
                 });
             }
             Err(e) => {
@@ -544,6 +631,96 @@ mod tests {
         let result = generate(32, &config).unwrap();
         assert_eq!(result.bytes.len(), 32);
         assert!(!result.source.is_empty());
+    }
+
+    // --- GPS additional-input invariants ---
+
+    #[test]
+    fn gps_additional_input_never_a_selectable_source() {
+        // Even with GPS enabled, it must never appear in either source builder
+        // (so it can never win the cascade or be graded in check / daemon
+        // self-test).
+        let mut config = Config::default();
+        config.hsm.gps.enabled = true;
+        config.hsm.gps.path = Some("/nonexistent/page17".into());
+        for s in build_generate_sources(&config) {
+            assert_ne!(
+                s.name(),
+                "gps-sf4p17",
+                "GPS must never be in the generate cascade"
+            );
+        }
+        for s in build_check_sources(&config) {
+            assert_ne!(
+                s.name(),
+                "gps-sf4p17",
+                "GPS must never be in the check builder"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_empty_addins_is_identity() {
+        let primary = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(fold_additional_input(primary.clone(), &[]), primary);
+    }
+
+    #[test]
+    fn fold_is_entropy_neutral_and_recoverable() {
+        let primary = vec![0xAAu8; 64];
+        let addin: &[u8] = b"public-gps-field-value"; // 22 bytes
+        let out = fold_additional_input(primary.clone(), &[("gps-sf4p17", addin)]);
+        assert_ne!(out, primary, "fold must change the bytes");
+        assert_eq!(out.len(), primary.len());
+
+        // Recompute the public mask and confirm output XOR mask == primary,
+        // proving the fold preserves (and cannot manufacture) entropy.
+        let key = crate::mixer::mix_entropy(&[("gps-sf4p17", addin)]);
+        let mask = crate::csprng::generate(key, primary.len());
+        let recovered: Vec<u8> = out.iter().zip(mask.iter()).map(|(o, m)| o ^ m).collect();
+        assert_eq!(
+            recovered, primary,
+            "output XOR public mask must recover primary"
+        );
+    }
+
+    #[test]
+    fn fold_differs_by_addin() {
+        let primary = vec![0x11u8; 48];
+        let a = fold_additional_input(
+            primary.clone(),
+            &[("gps-sf4p17", &b"AAAAAAAAAAAAAAAAAAAAAA"[..])],
+        );
+        let b = fold_additional_input(
+            primary.clone(),
+            &[("gps-sf4p17", &b"BBBBBBBBBBBBBBBBBBBBBB"[..])],
+        );
+        assert_ne!(a, b, "different addin must yield different output");
+    }
+
+    #[test]
+    fn gather_additional_inputs_empty_when_gps_disabled() {
+        let config = Config::default(); // gps.enabled == false by default
+        assert!(gather_additional_inputs(&config).is_empty());
+    }
+
+    #[test]
+    fn gather_additional_inputs_empty_when_enabled_but_unconfigured() {
+        let mut config = Config::default();
+        config.hsm.gps.enabled = true; // but no command/path => unavailable
+        assert!(gather_additional_inputs(&config).is_empty());
+    }
+
+    #[cfg(feature = "gps")]
+    #[test]
+    fn gather_skips_gps_when_collect_fails() {
+        // Enabled with a configured-but-broken path: is_available() is true,
+        // collect() fails, gather must degrade gracefully to empty.
+        let mut config = Config::default();
+        config.hsm.gps.enabled = true;
+        config.hsm.gps.path = Some("/nonexistent/page17".into());
+        config.hsm.gps.timeout_ms = 100;
+        assert!(gather_additional_inputs(&config).is_empty());
     }
 
     #[test]

@@ -106,6 +106,15 @@ fn build_config(
     if let Some(ref v) = hsm_args.yubihsm_password {
         hsm.yubihsm.password = Some(v.clone());
     }
+    if let Some(v) = hsm_args.enable_gps {
+        hsm.gps.enabled = v;
+    }
+    if let Some(ref v) = hsm_args.gps_command {
+        hsm.gps.command = Some(v.clone());
+    }
+    if let Some(ref v) = hsm_args.gps_path {
+        hsm.gps.path = Some(v.clone());
+    }
 
     if hsm_args.has_cli_secret() {
         let names = hsm_args.cli_secret_names().join(", ");
@@ -192,6 +201,27 @@ fn run_list_sources(config: &Config) {
             status,
             source.source_type(),
             source.description(),
+            detail
+        );
+    }
+
+    // GPS Subframe 4/Page 17 additional-input: shown for visibility but NEVER a
+    // graded/selectable source (kept out of build_check_sources). Probed only
+    // when the feature is built and the input is enabled.
+    #[cfg(feature = "gps")]
+    if config.hsm.gps.enabled {
+        use mixrand::entropy::EntropySource;
+        let src = entropy::gps::GpsSource::new(&config.hsm.gps);
+        let (status, detail) = match src.collect(PROBE_BYTES) {
+            Ok(_) => ("available", String::new()),
+            Err(e) => ("skip", format!(" ({})", e)),
+        };
+        println!(
+            "{:<12} {:<10} {:<10} {}{}",
+            src.name(),
+            status,
+            src.source_type(),
+            src.description(),
             detail
         );
     }
@@ -335,10 +365,13 @@ mod tests {
             enable_gnupg: None,
             enable_yubihsm: None,
             enable_sgx: None,
+            enable_gps: None,
             pkcs11_library: None,
             tpm2_device: None,
             pkcs11_pin: None,
             yubihsm_password: None,
+            gps_command: None,
+            gps_path: None,
         }
     }
 

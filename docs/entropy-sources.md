@@ -28,6 +28,35 @@ The `check` subcommand additionally splits `cpurng` into individual CPU
 instruction sources (`rdseed`, `rdrand`, `xstore`, `rndr`, `rndrrs`) so
 you can validate each path.
 
+## Additional inputs (not entropy sources)
+
+Separate from the cascade above, mixrand can fold optional **additional
+inputs** into output. These are NIST SP 800-90A *personalization
+strings*: public, non-secret values mixed in for domain separation /
+defense-in-depth, credited **0 bits** of entropy and **never** selectable
+as a source. They are absent from the cascade table and from `check`'s
+statistical grading.
+
+| Name         | Feature | Acquisition                                   | Entropy credit |
+| ------------ | ------- | --------------------------------------------- | -------------- |
+| `gps-sf4p17` | `gps`   | external GNSS decoder via `--gps-command` / `--gps-path` | **0 bits** |
+
+The **GPS Subframe 4/Page 17** "Special Message" field is *public broadcast
+data* — every receiver on Earth decodes the same 22 bytes, so it carries
+~0 bits of unpredictability. mixrand folds it as `output = primary XOR
+keystream`, where the keystream is a *public* ChaCha20 stream keyed by
+BLAKE2b of the field; this is entropy-neutral (it can never raise or lower
+the primary's security) and never blocks the entropy path. Wire it up with
+an external decoder (gnss-sdr, u-blox UBX, custom RTL-SDR) that writes the
+latest decoded field to a file/FIFO — standard NMEA/`gpsd` does **not**
+expose raw subframes. Full guide:
+[`docs/gps-additional-input.md`](gps-additional-input.md).
+
+```bash
+# Verify the additional input is wired up (informational row, not graded)
+mixrand list-sources | grep gps
+```
+
 ## Selection by use case
 
 ### General-purpose server
@@ -76,6 +105,12 @@ behavior rather than entropy quality.
 - **pcsc**: requires `pcscd` running; check with `pcsc_scan`.
 - **yubikey**: plug in device, run `ykman list` to verify detection.
 - **gnupg**: no setup beyond `gpg` on `$PATH`.
+- **gps** *(additional input, not an entropy source)*: requires an external
+  GNSS decoder that exposes *raw* Subframe 4/Page 17 (gnss-sdr, u-blox UBX
+  via `ubxtool`, or a custom RTL-SDR decoder). Point `--gps-path` at a
+  file/FIFO the decoder refreshes, or `--gps-command` at a script that
+  echoes the cached 22-byte field. Off by default. See
+  [`docs/gps-additional-input.md`](gps-additional-input.md).
 - **yubihsm**: start `yubihsm-connector -c yubihsm-connector.yaml` and
   point `connector_url` at `http://127.0.0.1:12345`.
 - **sgx**: needs SGX-capable CPU with BIOS-enabled SGX and one of
@@ -96,6 +131,10 @@ behavior rather than entropy quality.
 - [`docs/hsm/pcsc.md`](hsm/pcsc.md)
 - [`docs/hsm/gnupg.md`](hsm/gnupg.md)
 - [`docs/hsm/sgx.md`](hsm/sgx.md)
+
+Additional input (not an HSM, not an entropy source):
+
+- [`docs/gps-additional-input.md`](gps-additional-input.md)
 
 ## Validation
 

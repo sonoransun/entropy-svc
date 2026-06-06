@@ -102,3 +102,23 @@ auth_key_id = 1
 enabled = true
 # Path to the signed SGX enclave shared object.
 # enclave_path = "/usr/libexec/mixrand/mixrand_entropy_enclave.signed.so"
+
+# GPS Subframe 4/Page 17 "Special Message" field — a NIST SP 800-90A *additional input*
+# (personalization), NOT an entropy source. It is PUBLIC broadcast data (~0 bits of real
+# entropy) and is XOR-folded into output at 0-bit credit, never selectable, never graded.
+# Requires the `gps` build feature and an external GNSS decoder. Lives under [hsm.*] only
+# for config-plumbing reuse — it is not an HSM. See docs/gps-additional-input.md.
+[hsm.gps]
+# Off by default (unlike the HSM sources): building --features gps does nothing until
+# a command or path is configured below.
+enabled = false
+# Command run via `sh -c`; its stdout is the cached field (takes precedence over `path`).
+# Must return a cached value quickly — never a live capture.
+# command = "/usr/local/bin/gps-sf4p17-cache"
+# File or FIFO an external collector refreshes with the latest decoded field.
+# path = "/run/gps/sf4p17"
+# Acquisition timeout in ms; on timeout the field is skipped and generation proceeds.
+timeout_ms = 2000
+# Expected field length in bytes (176 bits = 22). A mismatched length is treated as
+# unavailable (misconfigured collector).
+expected_len = 22

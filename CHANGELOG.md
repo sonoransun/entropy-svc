@@ -31,6 +31,18 @@ once it reaches 1.0.
 
 ### Added
 
+- **GPS Subframe 4/Page 17 additional-input** (`gps` feature,
+  `src/entropy/gps.rs`) — folds the *public* GPS "Special Message"
+  broadcast field into output as a NIST SP 800-90A personalization string
+  at **0-bit entropy credit**. It is **not** an entropy source: it is
+  registered in no source cascade, never wins selection, never enters
+  `check` grading or the daemon self-test, and is XOR-folded with a public
+  keystream so it can neither raise nor lower the real entropy's security.
+  Acquired (with a hard timeout, never blocking generation) from an
+  external GNSS decoder via `--gps-command`/`--gps-path`,
+  `MIXRAND_GPS_*`, or `[hsm.gps]`. Off by default; in `all-sources` but
+  not `hsm`. Surfaces in `list-sources`/`check` as an informational
+  `additional-input` row. See `docs/gps-additional-input.md`.
 - **`SensitiveBytes`** wrapper (`src/sensitive.rs`) — `Deref<Target=
   [u8]>` + `Drop`-zeroize for short-lived entropy buffers. Used by
   `main.rs`, `daemon.rs::inject_entropy`, and the daemon main loop

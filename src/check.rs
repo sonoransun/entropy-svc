@@ -591,6 +591,23 @@ pub fn run(args: &CheckArgs, config: &Config) -> Result<(), Error> {
         eprintln!();
     }
 
+    // GPS Subframe 4/Page 17 additional-input is public data, not an entropy
+    // source: report its status for visibility but DO NOT add it to the graded
+    // `sources` (no FIPS / entropy estimates on a public constant).
+    #[cfg(feature = "gps")]
+    if config.hsm.gps.enabled && !quiet {
+        let src = crate::entropy::gps::GpsSource::new(&config.hsm.gps);
+        let status = if src.collect(0).is_ok() {
+            "available"
+        } else {
+            "unavailable"
+        };
+        eprintln!(
+            "additional-input: gps-sf4p17 [{}] — 0-bit credit, not statistically graded\n",
+            status
+        );
+    }
+
     let mut stats_vec: Vec<SourceStats> = sources.iter().map(|_| SourceStats::new()).collect();
 
     let start = Instant::now();

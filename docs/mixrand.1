@@ -161,6 +161,45 @@ Emit shell completion scripts.
 .I SHELL
 is one of
 .BR bash ", " zsh ", " fish ", " elvish ", " powershell .
+.SH ADDITIONAL INPUTS
+Built with the
+.B gps
+Cargo feature, mixrand can fold the GPS Subframe 4/Page 17 "Special
+Message" field into output as a NIST SP 800-90A
+.I additional input
+(personalization). This field is
+.B public broadcast data
+(~0 bits of real entropy): it is credited
+.B 0 bits
+of entropy, is never a standalone source, never enters
+.B check
+grading or the daemon self-test, and never blocks generation. It is
+XOR-folded with a public keystream into the selected source's output, so
+it can neither raise nor lower the real entropy's security. Off by
+default. These flags are available on every subcommand:
+.TP
+\fB\-\-enable\-gps\fR [\fIBOOL\fR]
+Enable or disable the GPS additional-input. Requires
+.B \-\-gps\-command
+or
+.BR \-\-gps\-path .
+.TP
+\fB\-\-gps\-command\fR \fICMD\fR
+Command (run via \fBsh -c\fR) whose stdout is the cached 22-byte field.
+Must return quickly \(em no live capture. Visible via
+.BR ps (1)
+/ /proc/<pid>/cmdline; prefer
+.B MIXRAND_GPS_COMMAND
+to avoid exposing secrets.
+.TP
+\fB\-\-gps\-path\fR \fIPATH\fR
+File or FIFO to read the field from (used when
+.B \-\-gps\-command
+is unset). Opened non-blocking with a timeout; a writer-less FIFO yields
+"unavailable" rather than hanging.
+.PP
+See
+.IR docs/gps-additional-input.md .
 .SH ENVIRONMENT
 Configuration layers merge in the order:
 defaults \(-> /etc/mixrand.toml (or \-\-config) \(-> MIXRAND_* env vars
@@ -187,6 +226,13 @@ PKCS#11 user PIN \(em always prefer this over
 .B MIXRAND_YUBIHSM_PASSWORD
 YubiHSM authentication password \(em always prefer this over
 .BR \-\-yubihsm\-password .
+.TP
+.B MIXRAND_GPS_ENABLED
+true|false \(em toggle the GPS Subframe 4/Page 17 additional-input
+(public data, 0-bit credit; requires the
+.B gps
+feature). See also
+.BR MIXRAND_GPS_COMMAND ", " MIXRAND_GPS_PATH ", " MIXRAND_GPS_TIMEOUT_MS ", " MIXRAND_GPS_EXPECTED_LEN .
 .PP
 See the full list in
 .IR docs/config.example.toml .

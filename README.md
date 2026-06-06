@@ -91,6 +91,7 @@ mixrand check -d 1m --sources=tpm2,pkcs11,gnupg
 
 - **Multi-source entropy**: Priority-ordered cascade across HSMs, secure elements, hardware RNG, CPU instructions (RDSEED, RDRAND, XSTORE, RNDR, RNDRRS), haveged, getrandom syscall, and a fallback mixer
 - **HSM & secure element support** *(feature-gated)*: Intel SGX, TPM 2.0, PKCS#11 (SoftHSM/YubiHSM/Thales/CloudHSM), PC/SC smart cards (JavaCard, OpenPGP), YubiKey PIV, YubiHSM 2 native, and GnuPG subprocess
+- **Optional additional inputs** *(feature-gated)*: fold public, non-secret values such as the GPS Subframe 4/Page 17 broadcast field into output as a **0-bit-credit** SP 800-90A personalization string — defense-in-depth domain separation, **never counted as entropy** (see [Additional inputs](#additional-inputs-not-entropy-sources))
 - **Cross-platform CPU RNG**: x86_64 (RDSEED/RDRAND/XSTORE via inline asm) and AArch64 (RNDR/RNDRRS for Apple Silicon and ARM servers)
 - **Dual mixer modes**: BLAKE2b-256 single-pass (default) or HKDF-style two-stage extract-then-expand for low-entropy inputs
 - **ChaCha20 CSPRNG**: Deterministic expansion with automatic reseeding every 1 MiB for large requests
@@ -460,6 +461,11 @@ flowchart TD
     Next --> Gate
 ```
 
+> **Additional inputs are not in this cascade.** Optional public values such as the GPS
+> Subframe 4/Page 17 field (`gps-sf4p17`) are **not** selectable sources and never appear above.
+> They are XOR-folded into the *selected* source's output at **0-bit credit** *after* the health
+> check — see [Additional inputs (not entropy sources)](#additional-inputs-not-entropy-sources).
+
 #### PKCS#11 Session Flow
 
 PKCS#11 provides a standard interface to any compliant HSM. Mixrand opens a session per `collect()` call to ensure thread safety.
@@ -577,6 +583,42 @@ flowchart LR
 | Thales Luna | `/usr/lib/libCryptoki2_64.so` |
 | AWS CloudHSM | `/opt/cloudhsm/lib/libcloudhsm_pkcs11.so` |
 | Nitrokey HSM | `/usr/lib/opensc-pkcs11.so` |
+
+### Additional inputs (not entropy sources)
+
+Beyond the entropy *sources* above, mixrand can fold optional **additional inputs** into its output.
+An additional input is a NIST SP 800-90A **personalization string**: a value that is *mixed in for
+domain separation / defense-in-depth* but is **not relied on for unpredictability**. It is credited
+**0 bits** of entropy and can **never** be a standalone source.
+
+The first such input is the **GPS Subframe 4/Page 17** "Special Message" field (`gps` feature).
+
+> ⚠️ **This is public data, not entropy.** GPS Subframe 4/Page 17 is broadcast in the clear and
+> decoded identically by every receiver on Earth — an attacker with any GPS receiver (or online
+> almanac data) knows it. It contributes **~0 bits** of unpredictability. mixrand therefore treats
+> it strictly as a 0-bit personalization value: it can never raise *or* lower the security of the
+> real entropy it is mixed with.
+
+How it is used:
+
+- **Never selectable / never graded.** It is registered in no source cascade and never enters the
+  `check` FIPS/entropy grading loop or the daemon start-up self-test.
+- **Entropy-neutral fold.** In `generate()`, after a strong source is selected and passes the health
+  check, the output becomes `primary XOR keystream`, where the keystream is a *public* ChaCha20
+  stream keyed by BLAKE2b of the field. Because the mask is a function of public data only, the
+  result is information-theoretically equivalent to the primary (recoverable as `output XOR mask`).
+- **0-bit credit in the daemon.** Kernel-pool crediting stays based on the primary source; the GPS
+  field adds 0 credited bits.
+- **Never blocks.** Acquisition uses a short timeout and a byte cap; on timeout/short-read/length
+  mismatch the field is skipped and generation proceeds unchanged. (A *live* page-17 capture can take
+  ~12.5 minutes, so mixrand only ever reads a *cached* value.)
+
+| Additional input | Feature | Acquisition | Entropy credit |
+|---|---|---|---|
+| `gps-sf4p17` | `gps` | external GNSS decoder via `--gps-command` (stdout) or `--gps-path` (file/FIFO) | **0 bits** (personalization only) |
+
+Full setup, requirements, worked examples, and troubleshooting:
+**[docs/gps-additional-input.md](docs/gps-additional-input.md)**.
 
 ## Use Cases
 
@@ -787,8 +829,12 @@ cargo build --release --features all-sources
 | `gnupg` | GnuPG subprocess | None |
 | `yubihsm-native` | YubiHSM 2 direct HTTP/USB | None (pure Rust) |
 | `sgx` | Intel SGX enclave entropy | None (runtime `libsgx_urts`) |
+| `gps` | GPS Subframe 4/Page 17 **additional input** — public data, **0-bit credit**, *not* an entropy source ([details](#additional-inputs-not-entropy-sources)) | None (external GNSS decoder) |
 | `hsm` | Meta: pkcs11 + tpm2 + pcsc + yubikey + gnupg | All of the above |
-| `all-sources` | Meta: hsm + yubihsm-native + sgx | All of the above |
+| `all-sources` | Meta: hsm + yubihsm-native + sgx + gps | All of the above |
+
+> `gps` is **not** part of the `hsm` meta-feature (it is not an HSM), but it *is* included in
+> `all-sources`.
 
 ## Usage Reference
 
@@ -887,6 +933,17 @@ mixrand completions <SHELL>      # Generate shell completions (bash, zsh, fish, 
       --tpm2-device <PATH>        TPM2 device path (default: /dev/tpmrm0)
 ```
 
+### Additional-input options (available on all commands, requires the `gps` feature)
+
+```bash
+      --enable-gps [BOOL]         Enable/disable the GPS Subframe 4/Page 17 additional-input
+                                  (public data, 0-bit credit; NOT an entropy source). Off by default.
+      --gps-command <CMD>         Command (run via `sh -c`) whose stdout is the cached 22-byte field.
+                                  Must return quickly — no live capture. WARNING: visible via `ps`
+                                  / /proc/<pid>/cmdline; prefer MIXRAND_GPS_COMMAND for secrets.
+      --gps-path <PATH>           File or FIFO to read the field from (used when --gps-command unset)
+```
+
 ## Configuration
 
 ### TOML file
@@ -943,6 +1000,17 @@ auth_key_id = 1
 [hsm.sgx]
 enabled = true
 # enclave_path = "/usr/lib/mixrand_entropy_enclave.signed.so"
+
+# GPS Subframe 4/Page 17 — an *additional input* (personalization), NOT an entropy
+# source. Public broadcast data, XOR-folded at 0-bit credit. Defaults OFF; requires
+# the `gps` build feature and an external GNSS decoder. (Lives under [hsm.*] only for
+# config plumbing reuse — it is not an HSM.)
+[hsm.gps]
+enabled = false
+# command = "/usr/local/bin/gps-sf4p17-cache"  # stdout = the field (run via `sh -c`); cached, fast
+# path = "/run/gps/sf4p17"                      # file/FIFO with the field (used if command unset)
+timeout_ms = 2000                               # acquisition timeout; never blocks the entropy path
+expected_len = 22                               # 176 bits = 22 bytes; mismatched length => skipped
 ```
 
 ### Environment variables
@@ -991,6 +1059,16 @@ All settings can be overridden via `MIXRAND_*` environment variables (layer betw
 | `MIXRAND_SGX_ENABLED` | bool | `true` |
 | `MIXRAND_SGX_ENCLAVE_PATH` | string | `/usr/lib/mixrand_entropy_enclave.signed.so` |
 
+#### Additional-input environment variables (`gps` feature)
+
+| Variable | Type | Default | Example |
+|---|---|---|---|
+| `MIXRAND_GPS_ENABLED` | bool | `false` | `true` |
+| `MIXRAND_GPS_COMMAND` | string | *(unset)* | `/usr/local/bin/gps-sf4p17-cache` |
+| `MIXRAND_GPS_PATH` | string | *(unset)* | `/run/gps/sf4p17` |
+| `MIXRAND_GPS_TIMEOUT_MS` | u64 | `2000` | `1000` |
+| `MIXRAND_GPS_EXPECTED_LEN` | usize | `22` | `22` |
+
 ## API and Implementation Reference
 
 ### EntropySource Trait
@@ -1032,6 +1110,12 @@ pub trait EntropySource: Send + Sync {
 | `fallback` | 40 | software | all | — | Multi-source mix (getrandom + procfs + jitter + CPU) |
 
 The main `generate()` function uses core sources (hwrng, cpurng, haveged, fallback) plus any enabled HSM sources. Sources are sorted by priority and tried in order. The `check` command probes all granular sources including HSM devices for per-source statistical testing.
+
+**Additional inputs (not in the table above, not selectable):**
+
+| Name | Type | Platform | Feature | Description |
+|------|------|----------|---------|-------------|
+| `gps-sf4p17` | `additional-input` | all | `gps` | GPS Subframe 4/Page 17 field — **0-bit credit**, XOR-folded into the selected source's output; never selectable, never graded. Surfaces in `list-sources`/`check` as informational only. See [Additional inputs](#additional-inputs-not-entropy-sources). |
 
 ### Mixer Modes
 

@@ -42,6 +42,8 @@ pub fn enabled_features() -> &'static [&'static str] {
             "gnupg",
             #[cfg(feature = "sgx")]
             "sgx",
+            #[cfg(feature = "gps")]
+            "gps",
             #[cfg(feature = "testing")]
             "testing",
         ]
@@ -108,6 +110,7 @@ mod tests {
             "yubihsm-native",
             "gnupg",
             "sgx",
+            "gps",
             "testing",
         ];
         for name in f {

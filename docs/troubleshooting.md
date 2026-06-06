@@ -145,6 +145,39 @@ ls /dev/sgx_enclave /dev/sgx/enclave /dev/isgx
 If none exist, SGX is either disabled in BIOS/UEFI or the driver
 hasn't loaded. `cpuid -l 7 -s 0 | grep SGX` confirms CPU capability.
 
+## GPS additional-input shows "skip" / "unavailable"
+
+The GPS Subframe 4/Page 17 input (`gps` feature) is an *additional input*,
+not an entropy source — it is **off by default** and credited **0 bits**.
+`mixrand list-sources | grep gps` showing `skip`/`unavailable` is benign;
+generation never fails because of it. To make it `available`:
+
+```bash
+# 1. It must be enabled AND given a command or path
+mixrand list-sources | grep gps     # "skip (... not configured ...)" => set command/path
+
+# 2. The producer must emit EXACTLY 22 bytes, no trailing newline
+wc -c < /run/gps/sf4p17             # must print 22
+```
+
+Common causes:
+
+- **Collector not running / cache stale**: start your decoder→cache loop
+  (see [`gps-additional-input.md`](gps-additional-input.md) and
+  `examples/gps-sf4p17-collector.sh`).
+- **Wrong length** (`gps field length N != expected 22`): a trailing
+  newline or wrong field. Emit exactly 22 raw bytes
+  (`printf '%s' "$f" | head -c 22`).
+- **Timeout**: a writer-less FIFO or slow command. Generation still
+  succeeds from the primary source; lower `MIXRAND_GPS_TIMEOUT_MS` to fail
+  fast. mixrand opens the path non-blocking and `poll(2)`s, so a
+  writer-less FIFO yields "unavailable" rather than hanging.
+- Run with `--log-level debug` to see the
+  `gps additional-input unavailable: …` reason.
+
+Remember: this never adds entropy. If output quality is the concern,
+enable a real source (TPM2, PKCS#11, hwrng, CPU RNG).
+
 ## FIPS tests fail during `check`
 
 A FIPS 140-2 monobit/poker/runs/long-runs failure indicates the source

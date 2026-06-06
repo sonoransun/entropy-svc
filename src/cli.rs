@@ -83,6 +83,12 @@ pub struct HsmArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub enable_sgx: Option<bool>,
 
+    /// Enable the GPS Subframe 4/Page 17 additional-input (public data, mixed in
+    /// at 0-bit credit; never a standalone entropy source). Requires
+    /// --gps-command or --gps-path.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_gps: Option<bool>,
+
     /// PKCS#11 library path (e.g. /usr/lib/softhsm/libsofthsm2.so)
     #[arg(long)]
     pub pkcs11_library: Option<String>,
@@ -98,6 +104,18 @@ pub struct HsmArgs {
     /// YubiHSM authentication password (WARNING: visible in process list — prefer MIXRAND_YUBIHSM_PASSWORD env var)
     #[arg(long)]
     pub yubihsm_password: Option<String>,
+
+    /// Command (run via `sh -c`) whose stdout is the GPS Subframe 4/Page 17
+    /// field. Must return a *cached* value quickly (no live capture). WARNING:
+    /// visible via `ps` / /proc/<pid>/cmdline — do not embed secrets; prefer
+    /// MIXRAND_GPS_COMMAND.
+    #[arg(long)]
+    pub gps_command: Option<String>,
+
+    /// File or FIFO to read the GPS Subframe 4/Page 17 field from (used when
+    /// --gps-command is unset).
+    #[arg(long)]
+    pub gps_path: Option<String>,
 }
 
 impl HsmArgs {

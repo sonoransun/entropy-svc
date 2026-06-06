@@ -260,6 +260,46 @@ impl Default for SgxConfig {
     }
 }
 
+/// GPS Subframe 4/Page 17 "Special Message" field as a NIST SP 800-90A
+/// additional-input / personalization string.
+///
+/// NOTE: this is **not** an HSM, despite living under [`HsmConfig`] (which is
+/// the de-facto home for all optional-source plumbing — env vars, CLI flags,
+/// validation). The decoded field is **public broadcast data** with ~0 bits of
+/// real entropy; it is *mixed* into output but **never** credited as entropy
+/// and **never** selectable as a standalone source. See `src/entropy/gps.rs`.
+///
+/// `enabled` defaults to **false** (unlike the HSM sources): building with
+/// `--features gps` does nothing until a `command` or `path` is configured.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct GpsConfig {
+    pub enabled: bool,
+    /// Command to run; its stdout is read as the field (takes precedence over `path`).
+    pub command: Option<String>,
+    /// File or FIFO to read the field from (used when `command` is unset).
+    pub path: Option<String>,
+    /// Acquisition timeout in milliseconds. Acquisition must never block the
+    /// entropy path — a live page-17 capture can take ~12.5 min, so the
+    /// command/file must return a *cached* value quickly.
+    pub timeout_ms: u64,
+    /// Expected field length in bytes (176 bits = 22 bytes). A read whose
+    /// length differs is treated as unavailable (misconfigured collector).
+    pub expected_len: usize,
+}
+
+impl Default for GpsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: None,
+            path: None,
+            timeout_ms: 2000,
+            expected_len: 22,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HsmConfig {
@@ -270,6 +310,8 @@ pub struct HsmConfig {
     pub gnupg: GnuPGConfig,
     pub yubihsm: YubiHsmConfig,
     pub sgx: SgxConfig,
+    /// GPS Subframe 4/Page 17 additional-input (not an HSM; see [`GpsConfig`]).
+    pub gps: GpsConfig,
 }
 
 impl HsmConfig {
@@ -293,6 +335,16 @@ impl HsmConfig {
         if self.yubihsm.auth_key_id == 0 {
             warnings.push("yubihsm auth_key_id clamped from 0 to 1".into());
             self.yubihsm.auth_key_id = 1;
+        }
+
+        if self.gps.timeout_ms == 0 {
+            warnings.push("gps timeout_ms clamped from 0 to 2000".into());
+            self.gps.timeout_ms = 2000;
+        }
+
+        if self.gps.expected_len == 0 {
+            warnings.push("gps expected_len clamped from 0 to 22".into());
+            self.gps.expected_len = 22;
         }
 
         warnings
@@ -401,6 +453,23 @@ pub fn apply_hsm_env_overrides(cfg: &mut HsmConfig) {
     }
     if let Some(v) = env_str("MIXRAND_SGX_ENCLAVE_PATH") {
         cfg.sgx.enclave_path = Some(v);
+    }
+
+    // GPS Subframe 4/Page 17 additional-input (not an HSM; see GpsConfig)
+    if let Some(v) = env_bool("MIXRAND_GPS_ENABLED") {
+        cfg.gps.enabled = v;
+    }
+    if let Some(v) = env_str("MIXRAND_GPS_COMMAND") {
+        cfg.gps.command = Some(v);
+    }
+    if let Some(v) = env_str("MIXRAND_GPS_PATH") {
+        cfg.gps.path = Some(v);
+    }
+    if let Some(v) = env_u64("MIXRAND_GPS_TIMEOUT_MS") {
+        cfg.gps.timeout_ms = v;
+    }
+    if let Some(v) = env_u64("MIXRAND_GPS_EXPECTED_LEN") {
+        cfg.gps.expected_len = v as usize;
     }
 }
 

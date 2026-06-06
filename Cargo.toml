@@ -12,8 +12,14 @@ yubikey = ["pcsc"]
 gnupg = []
 yubihsm-native = ["dep:yubihsm"]
 sgx = []
+# GPS Subframe 4/Page 17 "Special Message" field as a 0-bit-credit additional
+# input (NIST SP 800-90A personalization). Public broadcast data — never an
+# entropy source; see src/entropy/gps.rs. No compile-time deps (like gnupg).
+gps = []
 hsm = ["pkcs11", "tpm2", "pcsc", "yubikey", "gnupg"]
-all-sources = ["hsm", "yubihsm-native", "sgx"]
+# `gps` is intentionally NOT in `hsm` (it is not an HSM), but is in
+# `all-sources` since that means "everything optional".
+all-sources = ["hsm", "yubihsm-native", "sgx", "gps"]
 
 # Exposes the deterministic `MockEntropySource` type and any other
 # testing-only helpers to integration tests in `tests/`. Not intended for
